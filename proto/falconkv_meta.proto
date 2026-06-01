@@ -1,0 +1,98 @@
+syntax = "proto2";
+
+package falconkv;
+
+option cc_generic_services = true;
+
+service FalconKVMetaService {
+    rpc BatchExist(BatchExistRequest) returns (BatchExistResponse);
+    rpc BatchLookup(BatchLookupRequest) returns (BatchLookupResponse);
+    rpc StoreRegister(StoreRegisterRequest) returns (StoreRegisterResponse);
+    rpc ClientHeartbeat(ClientHeartbeatRequest) returns (ClientHeartbeatResponse);
+    rpc SyncCommit(SyncCommitRequest) returns (SyncCommitResponse);
+    rpc SyncRemove(SyncRemoveRequest) returns (SyncRemoveResponse);
+}
+
+// NOTE: renamed from AccessType to avoid clash with the C++ enum class
+// falconkv::AccessType defined in src/common/types.h.
+enum AccessTypeProto {
+    ACCESS_LOCAL_DIRECT = 0;
+    ACCESS_NODE_DIRECT = 1;
+    ACCESS_REMOTE_RPC = 2;
+}
+
+message KeyDesc {
+    optional string key = 1;
+    optional uint32 store_id = 2;
+    optional uint64 offset = 3;
+    optional uint32 size = 4;
+    optional string data_file = 5;
+    optional AccessTypeProto access_type = 6 [default = ACCESS_REMOTE_RPC];
+    optional uint32 node_id = 7;
+    optional string store_addr = 8;
+}
+
+message BatchExistRequest {
+    repeated string keys = 1;
+    optional string client_id = 2;
+}
+
+message BatchExistResponse {
+    optional int32 hit_count = 1;
+    repeated KeyDesc key_descs = 2;
+}
+
+message BatchLookupRequest {
+    repeated string keys = 1;
+}
+
+message BatchLookupResponse {
+    repeated KeyDesc key_descs = 1;
+}
+
+message StoreRegisterRequest {
+    optional uint32 store_id = 1;
+    optional string node_host = 2;
+    optional uint32 node_port = 3;
+    optional string ssd_path = 4;
+    optional string data_file = 5;
+    optional uint64 capacity_bytes = 6;
+    optional uint32 chunk_size = 7;
+    optional uint32 node_id = 8;
+}
+
+message StoreRegisterResponse {
+    optional int32 status = 1;
+    optional string error_msg = 2;
+}
+
+message ClientHeartbeatRequest {
+    optional string client_id = 1;
+    optional string node_host = 2;
+    optional uint32 local_store_id = 3;
+    optional uint32 node_id = 4;
+}
+
+message ClientHeartbeatResponse {
+    optional int32 status = 1;
+}
+
+// --- SyncCommit: Store pushes committed key metadata to Meta ---
+message SyncCommitRequest {
+    optional uint32 store_id = 1;
+    repeated KeyDesc key_records = 2;
+}
+
+message SyncCommitResponse {
+    optional int32 status = 1;
+}
+
+// --- SyncRemove: Store pushes removed/evicted key metadata to Meta ---
+message SyncRemoveRequest {
+    optional uint32 store_id = 1;
+    repeated string keys = 2;
+}
+
+message SyncRemoveResponse {
+    optional int32 status = 1;
+}

@@ -1,0 +1,210 @@
+#include "falconkv_bridge.h"
+
+#include "src/client/falconkv_client_impl.h"
+#include "src/store/falconkv_store.h"
+#include "src/common/config.h"
+#include "src/common/logging.h"
+
+namespace falconkv {
+
+FalconKVBridge::FalconKVBridge(const Config& config) {
+    // 加载全局配置
+    FalconKVConfig cfg;
+    if (!config.config_file.empty()) {
+        cfg = ConfigLoader::LoadFromFile(config.config_file);
+    }
+
+    // 初始化 glog（FLAGS 必须在 InitGoogleLogging 之前设置）
+#ifdef FALCONKV_HAS_GLOG
+    if (!cfg.client.log_dir.empty()) {
+        FLAGS_log_dir = cfg.client.log_dir;
+    } else {
+        FLAGS_logtostderr = true;
+    }
+    FLAGS_minloglevel = 0;  // 输出 INFO 及以上
+    static bool glog_initialized = false;
+    if (!glog_initialized) {
+        google::InitGoogleLogging("falconkv_client");
+        glog_initialized = true;
+    }
+#endif
+
+    // 创建并初始化 FalconKVStore
+    store_ = std::make_unique<FalconKVStore>(
+        FalconKVStore::Config::FromStoreConfig(cfg.store));
+    store_->Init(cfg.transfer.meta_addr);
+
+    // Start Store RPC server for cross-node ACCESS_REMOTE_RPC reads
+    if (cfg.store.listen_port > 0) {
+        store_service_ = std::make_unique<StoreServiceImpl>(store_.get());
+        store_rpc_server_ = std::make_unique<brpc::Server>();
+        store_rpc_server_->AddService(
+            store_service_.get(), brpc::SERVER_DOESNT_OWN_SERVICE);
+        std::string listen_addr = cfg.store.store_rpc_host + ":" +
+                                  std::to_string(cfg.store.listen_port);
+        if (store_rpc_server_->Start(listen_addr.c_str(), nullptr) != 0) {
+            LOG(ERROR) << "[FalconKVBridge] Failed to start Store RPC server at "
+                       << listen_addr;
+        } else {
+            LOG(INFO) << "[FalconKVBridge] Store RPC server listening on "
+                      << listen_addr;
+        }
+    }
+
+    // 创建 FalconKVClientImpl
+    FalconKVClientImpl::Config impl_config;
+    impl_config.config_file = config.config_file;
+    impl_config.cache_capacity = config.cache_capacity;
+    impl_ = std::make_unique<FalconKVClientImpl>(impl_config);
+
+    // 将 Store 绑定到 Client
+    impl_->SetLocalStore(store_.get());
+
+    // 启动 Fire-and-Forget 工作线程
+    int num_workers = 2;
+    for (int i = 0; i < num_workers; ++i) {
+        workers_.emplace_back([this] { WorkerLoop(); });
+    }
+}
+
+FalconKVBridge::~FalconKVBridge() {
+    Close();
+#ifdef FALCONKV_HAS_GLOG
+    // 不主动 ShutdownGoogleLogging，避免其他实例的日志失效
+    // google::ShutdownGoogleLogging();
+#endif
+}
+
+int FalconKVBridge::BatchExistSync(const std::vector<std::string>& keys) {
+    return impl_->BatchExistSync(keys);
+}
+
+int FalconKVBridge::BatchPutSync(const std::vector<std::string>& keys,
+                                  const std::vector<BridgeBuffer>& buffers) {
+    // BridgeBuffer → BufferInfo 适配
+    // BridgeBuffer 和 BufferInfo 布局一致，直接转换
+    std::vector<BufferInfo> buf_infos;
+    buf_infos.reserve(buffers.size());
+    for (const auto& b : buffers) {
+        buf_infos.push_back({b.data_ptr, b.size});
+    }
+
+    auto statuses = impl_->BatchPutSync(keys, buf_infos);
+    for (const auto& s : statuses) {
+        if (!s.ok()) return -1;
+    }
+    return 0;
+}
+
+std::vector<int32_t> FalconKVBridge::BatchGetSync(
+    const std::vector<std::string>& keys,
+    const std::vector<BridgeBuffer>& buffers) {
+    std::vector<BufferInfo> buf_infos;
+    buf_infos.reserve(buffers.size());
+    for (const auto& b : buffers) {
+        buf_infos.push_back({b.data_ptr, b.size});
+    }
+    return impl_->BatchGetSync(keys, buf_infos);
+}
+
+void FalconKVBridge::FireAndForgetPut(
+    const std::vector<std::string>& keys,
+    const std::vector<BridgeBuffer>& buffers,
+    void (*callback)(void*),
+    void* user_data) {
+    // 拷贝 keys（异步任务可能在调用者释放原始数据后执行）
+    auto keys_copy = std::make_shared<std::vector<std::string>>(keys);
+
+    // 拷贝 buffer 元信息（data_ptr 指向的内存由 Python INCREF 保护）
+    auto bufs_copy = std::make_shared<std::vector<BufferInfo>>();
+    bufs_copy->reserve(buffers.size());
+    for (const auto& b : buffers) {
+        bufs_copy->push_back({b.data_ptr, b.size});
+    }
+
+    // 提交到内部线程池
+    SubmitTask([this, keys_copy, bufs_copy, callback, user_data]() {
+        // 在工作线程中执行同步写入
+        auto statuses = impl_->BatchPutSync(*keys_copy, *bufs_copy);
+
+        // 写入完成（无论成功失败），回调通知 C Extension 层
+        // C Extension 层会获取 GIL 并执行 ref_count_down
+        callback(user_data);
+    });
+}
+
+void FalconKVBridge::Close() {
+    // 先排空异步队列
+    DrainQueue();
+
+    // 停止工作线程
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (stopped_.load()) return;
+        stopped_.store(true);
+    }
+    queue_cv_.notify_all();
+
+    for (auto& w : workers_) {
+        if (w.joinable()) w.join();
+    }
+    workers_.clear();
+
+    // 关闭底层 Client（先解除对 Store 的引用）
+    if (impl_) {
+        impl_->Close();
+        impl_->SetLocalStore(nullptr);
+        impl_.reset();
+    }
+
+    // 停止 Store RPC server
+    if (store_rpc_server_) {
+        store_rpc_server_->Stop(0);
+        store_rpc_server_->Join();
+        store_rpc_server_.reset();
+        store_service_.reset();
+    }
+
+    // 关闭 Store
+    if (store_) {
+        store_->Close();
+        store_.reset();
+    }
+}
+
+void FalconKVBridge::WorkerLoop() {
+    while (true) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            queue_cv_.wait(lock, [this] {
+                return stopped_.load() || !task_queue_.empty();
+            });
+            if (stopped_.load() && task_queue_.empty()) return;
+            task = std::move(task_queue_.front());
+            task_queue_.pop_front();
+        }
+        task();
+    }
+}
+
+void FalconKVBridge::SubmitTask(std::function<void()> task) {
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        task_queue_.push_back(std::move(task));
+    }
+    queue_cv_.notify_one();
+}
+
+void FalconKVBridge::DrainQueue() {
+    // 等待队列清空
+    while (true) {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        if (task_queue_.empty()) break;
+        lock.unlock();
+        // 短暂让步，等待工作线程处理
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+}  // namespace falconkv

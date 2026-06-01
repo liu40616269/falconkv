@@ -1,0 +1,77 @@
+syntax = "proto2";
+
+package falconkv;
+
+option cc_generic_services = true;
+
+service FalconKVStoreService {
+    rpc Read(ReadRequest) returns (ReadResponse);
+    rpc BatchRead(BatchReadRequest) returns (BatchReadResponse);
+    rpc GetByKey(GetByKeyRequest) returns (GetByKeyResponse);
+    rpc BatchGetByKey(BatchGetByKeyRequest) returns (BatchGetByKeyResponse);
+    rpc Ping(PingRequest) returns (PongResponse);
+}
+
+message ReadRequest {
+    optional uint64 offset = 1;
+    optional uint32 size = 2;
+    optional uint32 client_id = 3;
+    optional string source_node_addr = 4;
+}
+
+message ReadResponse {
+    optional int32 status = 1;
+    optional bytes data = 2;
+    optional uint32 bytes_read = 3;
+}
+
+message BatchReadSegment {
+    optional uint64 offset = 1;
+    optional uint32 size = 2;
+}
+
+message BatchReadRequest {
+    repeated BatchReadSegment segments = 1;
+}
+
+message BatchReadResponse {
+    optional int32 status = 1;
+    repeated bytes data_segments = 2;
+    repeated uint32 bytes_read = 3;
+}
+
+// --- Key-based read RPCs for remote clients ---
+
+message GetByKeyRequest {
+    optional string key = 1;
+    optional uint32 client_id = 2;
+    optional string source_node_addr = 3;
+}
+
+message GetByKeyResponse {
+    optional int32 status = 1;
+    optional bytes data = 2;
+    optional uint32 size = 3;
+}
+
+message BatchGetByKeyRequest {
+    repeated string keys = 1;
+    optional uint32 client_id = 2;
+    optional string source_node_addr = 3;
+}
+
+message BatchGetByKeyResponse {
+    optional int32 status = 1;
+    repeated bytes data_segments = 2;
+    repeated uint32 sizes = 3;
+    repeated int32 statuses = 4;
+}
+
+message PingRequest {
+    optional uint64 timestamp_ns = 1;
+}
+
+message PongResponse {
+    optional int32 status = 1;
+    optional uint64 timestamp_ns = 2;
+}

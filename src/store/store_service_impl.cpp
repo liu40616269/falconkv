@@ -1,0 +1,247 @@
+#include "src/store/store_service_impl.h"
+
+#include <brpc/closure_guard.h>
+#include <brpc/controller.h>
+
+#include <cstring>
+#include "src/common/time_util.h"
+
+namespace falconkv {
+
+StoreServiceImpl::StoreServiceImpl(FalconKVStore* store)
+    : store_(store) {}
+
+// -----------------------------------------------------------------
+// Read (offset-based, for remote client backward compatibility)
+// -----------------------------------------------------------------
+void StoreServiceImpl::Read(::google::protobuf::RpcController*,
+                             const ReadRequest* request,
+                             ReadResponse* response,
+                             ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    uint64_t offset = request->offset();
+    uint32_t size = request->size();
+
+    // Allocate aligned buffer for DirectIO read
+    void* buffer = AlignedAllocator::Allocate(512, size);
+    if (!buffer) {
+        response->set_status(-1);
+        return;
+    }
+
+    uint64_t request_ts_ns = GetCurrentTimeNs();
+    Status s = store_->Read(offset, buffer, size);
+    uint64_t done_ts_ns = GetCurrentTimeNs();
+
+    if (!s.ok()) {
+        AlignedAllocator::Free(buffer);
+        response->set_status(static_cast<int>(s.code()));
+        return;
+    }
+
+    // Report to Scheduler (Store perspective: NET_RX_READ)
+    if (store_->scheduler_proxy()) {
+        store_->scheduler_proxy()->StoreReportIOAsync(
+            store_->store_id(),
+            3,  // NET_RX_READ
+            request->client_id(),
+            size,
+            request_ts_ns,
+            done_ts_ns,
+            request->source_node_addr());
+    }
+
+    response->set_status(0);
+    response->set_data(buffer, size);
+    response->set_bytes_read(size);
+    AlignedAllocator::Free(buffer);
+}
+
+// -----------------------------------------------------------------
+// BatchRead (offset-based)
+// -----------------------------------------------------------------
+void StoreServiceImpl::BatchRead(::google::protobuf::RpcController*,
+                                  const BatchReadRequest* request,
+                                  BatchReadResponse* response,
+                                  ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    std::vector<ReadItem> items;
+    std::vector<std::unique_ptr<void, void(*)(void*)>> buffers;
+
+    items.reserve(request->segments_size());
+
+    for (int i = 0; i < request->segments_size(); ++i) {
+        const auto& seg = request->segments(i);
+        uint32_t size = seg.size();
+
+        void* buf = AlignedAllocator::Allocate(512, size);
+        if (!buf) {
+            response->set_status(-1);
+            return;
+        }
+        buffers.emplace_back(buf, &AlignedAllocator::Free);
+        items.push_back({seg.offset(), buf, size});
+    }
+
+    uint64_t total_io_size = 0;
+    for (const auto& item : items) total_io_size += item.size;
+
+    uint64_t request_ts_ns = GetCurrentTimeNs();
+    Status s = store_->BatchRead(items);
+    uint64_t done_ts_ns = GetCurrentTimeNs();
+
+    // Report to Scheduler (Store perspective: NET_RX_READ)
+    if (store_->scheduler_proxy() && s.ok()) {
+        store_->scheduler_proxy()->StoreReportIOAsync(
+            store_->store_id(),
+            3,  // NET_RX_READ
+            0,  // client_id not available in BatchReadRequest
+            total_io_size,
+            request_ts_ns,
+            done_ts_ns,
+            "");  // source_node_addr not available in BatchReadRequest
+    }
+
+    response->set_status(s.ok() ? 0 : static_cast<int>(s.code()));
+    for (const auto& item : items) {
+        response->add_data_segments(item.buffer, item.size);
+        response->add_bytes_read(s.ok() ? item.size : 0);
+    }
+}
+
+// -----------------------------------------------------------------
+// GetByKey (key-based read)
+// -----------------------------------------------------------------
+void StoreServiceImpl::GetByKey(::google::protobuf::RpcController*,
+                                 const GetByKeyRequest* request,
+                                 GetByKeyResponse* response,
+                                 ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    const std::string& key = request->key();
+
+    if (!store_->Contains(key)) {
+        response->set_status(static_cast<int>(Status::kNotFound));
+        return;
+    }
+
+    // Get the key record to know the size
+    // We need to allocate a buffer. Use a reasonable max size.
+    // For now, use the chunk_size as the max buffer size.
+    uint32_t max_size = store_->chunk_size();
+    void* buffer = AlignedAllocator::Allocate(512, max_size);
+    if (!buffer) {
+        response->set_status(-1);
+        return;
+    }
+
+    uint64_t request_ts_ns = GetCurrentTimeNs();
+    auto result = store_->Get(key, buffer, max_size);
+    uint64_t done_ts_ns = GetCurrentTimeNs();
+
+    if (!result.status.ok()) {
+        AlignedAllocator::Free(buffer);
+        response->set_status(static_cast<int>(result.status.code()));
+        return;
+    }
+
+    // Report to Scheduler (Store perspective: NET_RX_READ)
+    if (store_->scheduler_proxy()) {
+        store_->scheduler_proxy()->StoreReportIOAsync(
+            store_->store_id(),
+            3,  // NET_RX_READ
+            request->client_id(),
+            result.size,
+            request_ts_ns,
+            done_ts_ns,
+            request->source_node_addr());
+    }
+
+    response->set_status(0);
+    response->set_data(buffer, result.size);
+    response->set_size(result.size);
+    AlignedAllocator::Free(buffer);
+}
+
+// -----------------------------------------------------------------
+// BatchGetByKey (key-based batch read)
+// -----------------------------------------------------------------
+void StoreServiceImpl::BatchGetByKey(::google::protobuf::RpcController*,
+                                      const BatchGetByKeyRequest* request,
+                                      BatchGetByKeyResponse* response,
+                                      ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    uint32_t chunk_size = store_->chunk_size();
+    bool all_ok = true;
+
+    for (int i = 0; i < request->keys_size(); ++i) {
+        const std::string& key = request->keys(i);
+
+        if (!store_->Contains(key)) {
+            response->add_data_segments();
+            response->add_sizes(0);
+            response->add_statuses(static_cast<int>(Status::kNotFound));
+            all_ok = false;
+            continue;
+        }
+
+        void* buffer = AlignedAllocator::Allocate(512, chunk_size);
+        if (!buffer) {
+            response->add_data_segments();
+            response->add_sizes(0);
+            response->add_statuses(-1);
+            all_ok = false;
+            continue;
+        }
+
+        uint64_t request_ts_ns = GetCurrentTimeNs();
+        auto result = store_->Get(key, buffer, chunk_size);
+        uint64_t done_ts_ns = GetCurrentTimeNs();
+
+        if (!result.status.ok()) {
+            AlignedAllocator::Free(buffer);
+            response->add_data_segments();
+            response->add_sizes(0);
+            response->add_statuses(static_cast<int>(result.status.code()));
+            all_ok = false;
+            continue;
+        }
+
+        // Report to Scheduler (Store perspective: NET_RX_READ)
+        if (store_->scheduler_proxy()) {
+            store_->scheduler_proxy()->StoreReportIOAsync(
+                store_->store_id(),
+                3,  // NET_RX_READ
+                request->client_id(),
+                result.size,
+                request_ts_ns,
+                done_ts_ns,
+                request->source_node_addr());
+        }
+
+        response->add_data_segments(buffer, result.size);
+        response->add_sizes(result.size);
+        response->add_statuses(0);
+        AlignedAllocator::Free(buffer);
+    }
+
+    response->set_status(all_ok ? 0 : 1);
+}
+
+// -----------------------------------------------------------------
+// Ping
+// -----------------------------------------------------------------
+void StoreServiceImpl::Ping(::google::protobuf::RpcController*,
+                             const PingRequest* request,
+                             PongResponse* response,
+                             ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    response->set_status(0);
+    response->set_timestamp_ns(request->timestamp_ns());
+}
+
+} // namespace falconkv

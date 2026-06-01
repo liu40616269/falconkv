@@ -1,0 +1,75 @@
+syntax = "proto2";
+
+package falconkv;
+
+option cc_generic_services = true;
+
+service FalconKVSchedulerService {
+    rpc RequestIO(IORequest) returns (IOResponse);
+    rpc ReportIOCompletion(IOCompletionReport) returns (IOCompletionAck);
+    rpc StoreReportIO(StoreIOReport) returns (StoreIOAck);
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+enum IOChannel {
+    LOCAL_SSD_READ = 0;
+    LOCAL_SSD_WRITE = 1;
+    NET_TX_READ = 2;
+    NET_RX_READ = 3;
+}
+
+message IORequest {
+    optional uint32 client_id = 1;
+    optional IOChannel io_channel = 2;
+    optional uint32 store_id = 3;
+    optional uint64 io_size = 4;
+    optional uint32 priority = 5;
+    optional uint64 request_ts_ns = 6;
+    optional string remote_node_addr = 7;
+}
+
+message IOResponse {
+    optional int32 status = 1;
+    optional uint64 permitted_ts_ns = 2;
+    optional uint64 ticket = 3;
+}
+
+message IOCompletionReport {
+    optional uint32 client_id = 1;
+    optional uint64 ticket = 2;
+    optional uint64 io_start_ts_ns = 3;
+    optional uint64 io_done_ts_ns = 4;
+    optional uint64 io_size = 5;
+    optional IOChannel io_channel = 6;
+    optional int32 io_status = 7;
+    optional uint32 store_id = 8;
+    optional string remote_node_addr = 9;
+}
+
+message IOCompletionAck {
+    optional int32 status = 1;
+}
+
+message StoreIOReport {
+    optional uint32 store_id = 1;
+    optional IOChannel io_channel = 2;
+    optional uint32 source_client_id = 3;
+    optional uint64 io_size = 4;
+    optional uint64 request_ts_ns = 5;
+    optional uint64 done_ts_ns = 6;
+    optional string source_node_addr = 7;
+}
+
+message StoreIOAck {
+    optional int32 status = 1;
+}
+
+message HeartbeatRequest {
+    optional uint32 client_id = 1;
+    optional uint64 timestamp_ns = 2;
+}
+
+message HeartbeatResponse {
+    optional int32 status = 1;
+    optional uint64 timestamp_ns = 2;
+}
