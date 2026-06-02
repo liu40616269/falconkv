@@ -36,7 +36,9 @@ Status StoreRpcClient::Connect(const std::string& addr) {
     return Status::OK();
 }
 
-Status StoreRpcClient::Read(uint64_t offset, void* buffer, uint32_t size) {
+Status StoreRpcClient::Read(uint64_t offset, void* buffer, uint32_t size,
+                             uint32_t client_id,
+                             const std::string& source_node_addr) {
     if (!connected_) {
         LOG(ERROR) << "[StoreRpcClient] Read: not connected";
         return Status::RpcError("not connected");
@@ -45,6 +47,8 @@ Status StoreRpcClient::Read(uint64_t offset, void* buffer, uint32_t size) {
     ReadRequest request;
     request.set_offset(offset);
     request.set_size(size);
+    request.set_client_id(client_id);
+    request.set_source_node_addr(source_node_addr);
 
     ReadResponse response;
     brpc::Controller cntl;

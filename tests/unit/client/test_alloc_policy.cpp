@@ -52,7 +52,6 @@ TEST(AllocPolicyTest, AccessTypeLocalDirect) {
     config.ssd_path = tmp_dir;
     config.store_id = 1;
     config.capacity_bytes = 4 * 1024 * 1024;
-    config.chunk_size = 4096;
     config.page_size = 4096;
     config.disable_mtime = true;
     config.scheduler_enabled = false;
@@ -123,8 +122,7 @@ TEST(AllocPolicyTest, AccessTypeNodeDirect) {
 // ---------------------------------------------------------------------------
 TEST(AllocPolicyTest, AccessTypeRemoteRpc) {
     // Build a KeyDescriptor that requires remote RPC.
-    KeyDescriptor desc;
-    desc.key = "remote_key";
+    KeyDescriptor desc("remote_key");
     desc.store_id = 99;
     desc.offset = 0;
     desc.size = 4096;
@@ -149,7 +147,6 @@ TEST(AllocPolicyTest, AllStoresNoSpace) {
     // capacity = 4 pages (power of 2 for buddy allocator), chunk = 1 page.
     // BuddyAllocator: total_pages=4, max_order=2, can allocate exactly 4 chunks.
     config.capacity_bytes = 4 * 4096;
-    config.chunk_size = 4096;
     config.page_size = 4096;
     config.disable_mtime = true;
     config.scheduler_enabled = false;

@@ -63,12 +63,11 @@ Status MetaSyncClient::Connect(const std::string& meta_addr) {
 
 void MetaSyncClient::SetStoreInfo(uint32_t store_id, uint32_t node_id,
                                    const std::string& data_file,
-                                   uint64_t capacity_bytes, uint32_t chunk_size) {
+                                   uint64_t capacity_bytes) {
     store_id_ = store_id;
     node_id_ = node_id;
     data_file_ = data_file;
     capacity_bytes_ = capacity_bytes;
-    chunk_size_ = chunk_size;
 }
 
 void MetaSyncClient::SetMetaIndex(StoreMetaIndex* meta_index) {
@@ -174,8 +173,7 @@ Status MetaSyncClient::SyncRemove(uint32_t store_id,
 
 Status MetaSyncClient::RegisterStore(uint32_t store_id, uint32_t node_id,
                                       const std::string& data_file,
-                                      uint64_t capacity_bytes,
-                                      uint32_t chunk_size) {
+                                      uint64_t capacity_bytes) {
     if (!connected_.load() || !stub_) {
         return Status::OK(); // skip if not connected
     }
@@ -185,7 +183,6 @@ Status MetaSyncClient::RegisterStore(uint32_t store_id, uint32_t node_id,
     request.set_node_id(node_id);
     request.set_data_file(data_file);
     request.set_capacity_bytes(capacity_bytes);
-    request.set_chunk_size(chunk_size);
     if (store_rpc_port_ > 0) {
         request.set_node_host(store_rpc_host_);
         request.set_node_port(store_rpc_port_);
@@ -273,7 +270,7 @@ void MetaSyncClient::FullResync() {
     Status s;
     for (int attempt = 0; attempt < 3; ++attempt) {
         s = RegisterStore(store_id_, node_id_, data_file_,
-                          capacity_bytes_, chunk_size_);
+                          capacity_bytes_);
         if (s.ok()) break;
         LOG(WARNING) << "[MetaSyncClient] FullResync: RegisterStore attempt "
                      << (attempt + 1) << " failed: " << s.ToString();

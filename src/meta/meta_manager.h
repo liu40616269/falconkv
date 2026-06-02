@@ -32,7 +32,6 @@ struct StoreInfo {
     uint32_t node_id = 0;
     std::string store_addr;   // remote RPC routing
     std::string data_file;    // same-node DirectIO path
-    uint32_t chunk_size = 0;  // DirectIO alignment
 };
 
 class MetaManager {

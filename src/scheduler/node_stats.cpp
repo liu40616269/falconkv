@@ -200,8 +200,22 @@ void NodeStats::PrintReport() const {
                   << " us  samples=" << sorted.size();
     }
 
-    LOG(INFO) << "  SSD BW utilization: " << std::fixed << std::setprecision(1)
-              << (GetSSDBandwidthUtilization() * 100.0) << "%";
+    // Compute SSD BW utilization inline (mutex_ is already held by
+    // PrintReport, so we must NOT call GetSSDBandwidthUtilization() which
+    // would try to re-acquire the non-recursive mutex and deadlock).
+    {
+        uint64_t ssd_bytes = w.local_ssd_read.total_bytes
+                           + w.local_ssd_write.total_bytes
+                           + w.net_rx_read.total_bytes;
+        double util = 0.0;
+        if (ssd_bw_limit_mbps_ > 0.0 && window_ns > 0) {
+            double bw = (static_cast<double>(ssd_bytes) / (1024.0 * 1024.0))
+                      / (static_cast<double>(window_ns) / 1e9);
+            util = bw / ssd_bw_limit_mbps_;
+        }
+        LOG(INFO) << "  SSD BW utilization: " << std::fixed << std::setprecision(1)
+                  << (util * 100.0) << "%";
+    }
 
     if (!node_addr_stats_.empty()) {
         LOG(INFO) << "  Per-node stats (" << node_addr_stats_.size() << " nodes):";

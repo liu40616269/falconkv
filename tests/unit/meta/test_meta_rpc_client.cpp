@@ -24,7 +24,6 @@ protected:
         info.node_id = 0;
         info.store_addr = "localhost:8901";
         info.data_file = "/tmp/falconkv_test_rpc/data_0.db";
-        info.chunk_size = 2 * 1024 * 1024;
 
         ASSERT_TRUE(server_->GetMetaManager()->RegisterStore(info).ok());
         ASSERT_TRUE(server_->Start().ok());

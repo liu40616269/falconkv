@@ -53,18 +53,21 @@ def _can_import_client():
         return False
 
 
-def _make_client(ssd_dir, store_id=1, capacity_gb=1, chunk_size=4096):
+def _make_client(ssd_dir, log_dir="/tmp/falconkv_log", store_id=1, capacity_gb=1, page_size=4096):
     """Create a pyfalconkv.Client backed by a temporary local SSD store."""
     from pyfalconkv.client import Client
 
+    os.makedirs(log_dir, exist_ok=True)
     config = {
+        "common": {
+            "log_dir": log_dir,
+        },
         "store": {
             "ssd_path": ssd_dir,
             "store_id": store_id,
             "node_id": 1,
             "capacity_gb": capacity_gb,
-            "chunk_size": chunk_size,
-            "page_size": chunk_size,
+            "page_size": page_size,
             "io_threads": 2,
             "buffer_pool_size": 4,
             "scheduler_enabled": False,
@@ -74,7 +77,7 @@ def _make_client(ssd_dir, store_id=1, capacity_gb=1, chunk_size=4096):
             "scheduler_enabled": False,
         },
         "meta": {"listen_addr": "0.0.0.0:19999"},
-        "scheduler": {"uds_path": "/tmp/nonexistent.sock", "enabled": False},
+        "scheduler": {"uds_path": "/tmp/nonexistent.sock"},
         "transfer": {"meta_addr": "localhost:19999"},
     }
     config_path = os.path.join(ssd_dir, "config.json")
@@ -97,10 +100,10 @@ def ssd_dir():
 
 
 @pytest.fixture
-def client(ssd_dir):
+def client(ssd_dir, test_log_dir):
     if not _can_import_client():
         pytest.skip("pyfalconkv.Client not available")
-    c = _make_client(ssd_dir)
+    c = _make_client(ssd_dir, log_dir=test_log_dir)
     yield c
     c.close()
 
@@ -156,17 +159,17 @@ class TestBatchPutGet:
             assert r.read_bytes() == data, f"Data mismatch for {key}"
 
     def test_overwrite_key(self, client):
-        """Put same key twice → second value wins."""
+        """Put same key twice → second put is skipped, first value wins."""
         w1 = BufferGuard(b"AAAA" * 1024)
         w2 = BufferGuard(b"BBBB" * 1024)
 
         client.batch_put_sync(["k"], [w1.ptr], [w1.size])
         client.batch_put_sync(["k"], [w2.ptr], [w2.size])
 
-        r = ZeroBuffer(w2.size)
+        r = ZeroBuffer(w1.size)
         results = client.batch_get_sync(["k"], [r.ptr], [r.size])
-        assert results[0] == w2.size
-        assert r.read_bytes() == b"BBBB" * 1024
+        assert results[0] == w1.size
+        assert r.read_bytes() == b"AAAA" * 1024
 
     def test_get_nonexistent_key(self, client):
         """Get a key that was never put → returns <=0."""
@@ -244,24 +247,35 @@ class TestSequentialWrites:
 
         assert errors == 0, f"{errors}/100 keys had mismatch"
 
-    def test_latest_write_wins(self, client):
-        """Repeated writes to the same key; each read sees the latest."""
-        for version in range(5):
+    def test_duplicate_put_skipped(self, client):
+        """Repeated writes to the same key → first value wins, subsequent puts skipped."""
+        # First put succeeds.
+        data_v0 = bytes([0]) * 4096
+        w0 = BufferGuard(data_v0)
+        client.batch_put_sync(["ver_key"], [w0.ptr], [w0.size])
+
+        r = ZeroBuffer(4096)
+        results = client.batch_get_sync(["ver_key"], [r.ptr], [r.size])
+        assert results[0] == 4096
+        assert r.read_bytes() == data_v0
+
+        # Subsequent puts are skipped — value stays the same.
+        for version in range(1, 5):
             data = bytes([version]) * 4096
             w = BufferGuard(data)
             client.batch_put_sync(["ver_key"], [w.ptr], [w.size])
 
-            r = ZeroBuffer(4096)
-            results = client.batch_get_sync(["ver_key"], [r.ptr], [r.size])
-            assert results[0] == 4096
-            assert r.read_bytes() == data, f"Version {version} mismatch"
+            r2 = ZeroBuffer(4096)
+            results2 = client.batch_get_sync(["ver_key"], [r2.ptr], [r2.size])
+            assert results2[0] == 4096
+            assert r2.read_bytes() == data_v0, f"Version {version} should not overwrite"
 
 
 @pytest.mark.skipif(not _can_import_client(), reason="pyfalconkv not available")
 class TestClientLifecycle:
     """Client create/close/recreate lifecycle."""
 
-    def test_create_close_recreate_fresh(self, ssd_dir):
+    def test_create_close_recreate_fresh(self, ssd_dir, test_log_dir):
         """Client can be created, closed, and recreated on the same SSD path.
 
         Note: Local FalconKVStore keeps metadata in memory. After close(),
@@ -271,7 +285,7 @@ class TestClientLifecycle:
         """
         data = b"persist" * 256  # 4096 bytes, chunk-aligned
 
-        c1 = _make_client(ssd_dir)
+        c1 = _make_client(ssd_dir, log_dir=test_log_dir)
         w = BufferGuard(data)
         c1.batch_put_sync(["persist_key"], [w.ptr], [w.size])
 
@@ -279,7 +293,7 @@ class TestClientLifecycle:
         c1.close()
 
         # Recreate — this starts a fresh store with empty in-memory index.
-        c2 = _make_client(ssd_dir)
+        c2 = _make_client(ssd_dir, log_dir=test_log_dir)
 
         # New client can write and read new data.
         w2 = BufferGuard(b"fresh_data_after_restart")

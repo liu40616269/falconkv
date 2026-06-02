@@ -45,7 +45,6 @@ protected:
         info.node_id = 0;
         info.store_addr = "localhost:8901";
         info.data_file = "/tmp/falconkv_test/data_0.db";
-        info.chunk_size = 2 * 1024 * 1024;            // 2 MB
 
         ASSERT_TRUE(meta_.RegisterStore(info).ok());
 
@@ -62,7 +61,6 @@ TEST_F(MetaServiceImplTest, StoreRegisterSucceeds) {
     req.set_node_host("localhost");
     req.set_node_port(8902);
     req.set_data_file("/tmp/data_2.db");
-    req.set_chunk_size(2 * 1024 * 1024);
 
     StoreRegisterResponse resp;
     TestController cntl;

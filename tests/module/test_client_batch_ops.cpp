@@ -31,7 +31,6 @@ protected:
         store_config.store_id = 1;
         store_config.node_id = 1;
         store_config.capacity_bytes = 16 * 1024 * 1024;
-        store_config.chunk_size = 4096;
         store_config.page_size = 4096;
         store_config.disable_mtime = true;
         store_config.scheduler_enabled = false;
@@ -143,8 +142,7 @@ TEST_F(ClientBatchOpsTest, BatchGetL0Local) {
     // Build KeyDescriptors for local access.
     std::vector<KeyDescriptor> descs;
     for (int i = 0; i < N; ++i) {
-        KeyDescriptor desc;
-        desc.key = keys[i];
+        KeyDescriptor desc(keys[i]);
         desc.access_type = AccessType::ACCESS_LOCAL_DIRECT;
         descs.push_back(desc);
     }
@@ -172,8 +170,7 @@ TEST_F(ClientBatchOpsTest, BatchGetL0Local) {
 TEST_F(ClientBatchOpsTest, BatchGetNodeDirect) {
     // The client's NodeLocalAccessor does not have a store file registered.
     // A BatchGet with ACCESS_NODE_DIRECT should fail gracefully.
-    KeyDescriptor desc;
-    desc.key = "node_key";
+    KeyDescriptor desc("node_key");
     desc.store_id = 99;
     desc.access_type = AccessType::ACCESS_NODE_DIRECT;
 
@@ -196,9 +193,8 @@ TEST_F(ClientBatchOpsTest, BatchPutNoSpace) {
     FalconKVStore::Config config;
     config.ssd_path = tiny_dir;
     config.store_id = 99;
-    // Power-of-2 pages for buddy allocator: 4 pages, 1 page per chunk.
+    // Power-of-2 pages for buddy allocator: 4 pages.
     config.capacity_bytes = 4 * 4096;
-    config.chunk_size = 4096;
     config.page_size = 4096;
     config.disable_mtime = true;
     config.scheduler_enabled = false;
@@ -237,8 +233,7 @@ TEST_F(ClientBatchOpsTest, BatchPutNoSpace) {
 // MT-C-006: ACCESS_REMOTE_RPC fails gracefully without RPC
 // ---------------------------------------------------------------------------
 TEST_F(ClientBatchOpsTest, BatchGetRpcFallback) {
-    KeyDescriptor desc;
-    desc.key = "remote_key";
+    KeyDescriptor desc("remote_key");
     desc.store_id = 99;
     desc.access_type = AccessType::ACCESS_REMOTE_RPC;
     desc.store_addr = "255.255.255.255:9999";

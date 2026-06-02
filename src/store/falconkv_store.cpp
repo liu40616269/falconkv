@@ -6,6 +6,7 @@
 #include "src/store/evict_manager.h"
 #include "src/common/buddy_allocator.h"
 #include "src/common/logging.h"
+#include "src/common/time_util.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -46,11 +47,13 @@ FalconKVStore::Config FalconKVStore::Config::FromStoreConfig(const StoreConfig& 
     cfg.store_id = sc.store_id;
     cfg.node_id = sc.node_id;
     cfg.capacity_bytes = sc.capacity_bytes;
-    cfg.chunk_size = sc.chunk_size;
     cfg.page_size = sc.page_size;
     cfg.io_threads = sc.io_threads;
     cfg.scheduler_enabled = sc.scheduler_enabled;
     cfg.scheduler_uds_path = sc.scheduler_uds_path;
+    cfg.scheduler_rpc_timeout_us = sc.scheduler_rpc_timeout_us;
+    cfg.max_consecutive_failures = sc.max_consecutive_failures;
+    cfg.reconnect_interval_sec = sc.reconnect_interval_sec;
     cfg.store_rpc_host = sc.store_rpc_host;
     cfg.listen_port = sc.listen_port;
     cfg.meta_addr = sc.meta_addr;
@@ -96,14 +99,13 @@ Status FalconKVStore::Init(const std::string& meta_addr) {
     }
 
     // Create the aligned buffer pool for DirectIO operations.
+    constexpr uint32_t kDefaultBufferSize = 2 * 1024 * 1024; // 2MB
     buffer_pool_ = std::make_unique<AlignedBufferPool>(
-        config_.chunk_size, config_.page_size, config_.io_threads * 2);
+        kDefaultBufferSize, config_.page_size, config_.io_threads * 2);
 
     // Initialize BuddyAllocator for space management.
-    uint32_t chunk_pages = config_.chunk_size / config_.page_size;
-    if (chunk_pages == 0) chunk_pages = 1;
     allocator_ = std::make_unique<BuddyAllocator>(
-        config_.capacity_bytes, config_.page_size, chunk_pages);
+        config_.capacity_bytes, config_.page_size);
 
     // Initialize local metadata index.
     meta_index_ = std::make_unique<StoreMetaIndex>();
@@ -112,7 +114,7 @@ Status FalconKVStore::Init(const std::string& meta_addr) {
     meta_sync_client_ = std::make_unique<MetaSyncClient>();
     std::string addr = meta_addr.empty() ? config_.meta_addr : meta_addr;
     meta_sync_client_->SetStoreInfo(store_id_, config_.node_id, data_file_,
-                                     config_.capacity_bytes, config_.chunk_size);
+                                     config_.capacity_bytes);
     meta_sync_client_->SetMetaIndex(meta_index_.get());
     meta_sync_client_->SetStoreRpcAddr(config_.store_rpc_host, config_.listen_port);
     meta_sync_client_->Connect(addr);  // Connect triggers FullResync on success.
@@ -137,7 +139,10 @@ Status FalconKVStore::Init(const std::string& meta_addr) {
 
     // Initialize SchedulerProxy if enabled
     if (config_.scheduler_enabled && !config_.scheduler_uds_path.empty()) {
-        scheduler_proxy_ = std::make_unique<SchedulerProxy>(config_.scheduler_uds_path);
+        scheduler_proxy_ = std::make_unique<SchedulerProxy>(config_.scheduler_uds_path,
+                                                             config_.scheduler_rpc_timeout_us / 1000,
+                                                             config_.max_consecutive_failures,
+                                                             config_.reconnect_interval_sec);
     }
 
     // Start background threads after running_ is set.
@@ -463,8 +468,17 @@ StorePutResult FalconKVStore::Put(const std::string& key, const void* data,
                                    uint32_t size) {
     StorePutResult result;
 
+    // 0. Skip if key already exists — avoid space leak from overwriting
+    //    the old StoreKeyRecord without freeing its allocated offset.
+    if (meta_index_->Get(key).has_value()) {
+        LOG(INFO) << "[FalconKVStore] Put: key already exists, skipping: " << key;
+        result.status = Status::OK();
+        return result;
+    }
+
     // 1. Allocate space via BuddyAllocator
-    int64_t offset = allocator_->AllocChunk();
+    uint32_t alloc_size = 0;
+    int64_t offset = allocator_->Alloc(size, &alloc_size);
     if (offset < 0) {
         LOG(WARNING) << "[FalconKVStore] Put: out of space for key: " << key;
         result.status = Status::NoSpace("Store out of space for key: " + key);
@@ -472,12 +486,12 @@ StorePutResult FalconKVStore::Put(const std::string& key, const void* data,
     }
 
     result.offset = static_cast<uint64_t>(offset);
-    result.chunk_size = config_.chunk_size;
+    result.alloc_size = alloc_size;
 
     // 2. Write data to SSD
     Status write_status = Write(static_cast<uint64_t>(offset), data, size);
     if (!write_status.ok()) {
-        allocator_->FreeChunk(offset);
+        allocator_->Free(offset, alloc_size);
         LOG(ERROR) << "[FalconKVStore] Put: write failed for key: " << key
                    << " at offset " << offset << ": " << write_status.ToString();
         result.status = write_status;
@@ -489,8 +503,9 @@ StorePutResult FalconKVStore::Put(const std::string& key, const void* data,
     record.key = key;
     record.offset = result.offset;
     record.size = size;
-    record.chunk_size = config_.chunk_size;
+    record.alloc_size = alloc_size;
     record.stat = 1; // committed
+    record.access_time_ms = GetWallTimeMs();
     meta_index_->Put(key, record);
 
     // 4. Sync to Meta (best effort, non-blocking for now)
@@ -526,8 +541,18 @@ std::vector<StorePutResult> FalconKVStore::BatchPut(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto& result = results[i];
 
+        // 0. Skip if key already exists — avoid space leak from overwriting
+        //    the old StoreKeyRecord without freeing its allocated offset.
+        if (meta_index_->Get(keys[i]).has_value()) {
+            LOG(INFO) << "[FalconKVStore] BatchPut: key already exists, skipping: "
+                      << keys[i];
+            result.status = Status::OK();
+            continue;
+        }
+
         // 1. Allocate space
-        int64_t offset = allocator_->AllocChunk();
+        uint32_t alloc_size = 0;
+        int64_t offset = allocator_->Alloc(sizes[i], &alloc_size);
         if (offset < 0) {
             LOG(WARNING) << "[FalconKVStore] BatchPut: out of space for key: " << keys[i];
             result.status = Status::NoSpace("Store out of space for key: " + keys[i]);
@@ -535,13 +560,13 @@ std::vector<StorePutResult> FalconKVStore::BatchPut(
         }
 
         result.offset = static_cast<uint64_t>(offset);
-        result.chunk_size = config_.chunk_size;
+        result.alloc_size = alloc_size;
 
         // 2. Write data
         Status write_status = Write(static_cast<uint64_t>(offset),
                                     data_ptrs[i], sizes[i]);
         if (!write_status.ok()) {
-            allocator_->FreeChunk(offset);
+            allocator_->Free(offset, alloc_size);
             LOG(ERROR) << "[FalconKVStore] BatchPut: write failed for key: " << keys[i]
                        << " at offset " << offset << ": " << write_status.ToString();
             result.status = write_status;
@@ -553,8 +578,9 @@ std::vector<StorePutResult> FalconKVStore::BatchPut(
         record.key = keys[i];
         record.offset = result.offset;
         record.size = sizes[i];
-        record.chunk_size = config_.chunk_size;
+        record.alloc_size = alloc_size;
         record.stat = 1;
+        record.access_time_ms = GetWallTimeMs();
         meta_index_->Put(keys[i], record);
         committed_records.push_back(record);
 
@@ -642,7 +668,7 @@ Status FalconKVStore::Remove(const std::string& key) {
     }
 
     // 3. Enqueue for deferred space reclamation (grace period).
-    pending_evict_queue_->Enqueue(key, record->offset);
+    pending_evict_queue_->Enqueue(key, record->offset, record->alloc_size);
 
     return Status::OK();
 }

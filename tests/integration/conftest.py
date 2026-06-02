@@ -32,6 +32,9 @@ BUILD_DIR = os.path.abspath(BUILD_DIR)
 FALCONKV_MASTER = os.path.join(BUILD_DIR, "src", "meta", "falconkv_master")
 FALCONKV_SCHED = os.path.join(BUILD_DIR, "src", "scheduler", "falconkv_sched")
 
+# Default log directory for all integration test services (meta/scheduler/client).
+FALCONKV_TEST_LOG_DIR = "/tmp/falconkv_log"
+
 
 def _wait_for_port(host, port, timeout=10):
     """Wait until a TCP port is accepting connections."""
@@ -75,10 +78,26 @@ def temp_ssd_dir():
 
 
 # ---------------------------------------------------------------------------
+# Fixture: per-test-case log directory
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def test_log_dir(request):
+    """Create a per-test-case log directory under FALCONKV_TEST_LOG_DIR.
+
+    Structure: /tmp/falconkv_log/{file_stem}/{test_function_name}/
+    """
+    file_stem = os.path.splitext(os.path.basename(request.node.path))[0]
+    test_name = request.node.name
+    log_dir = os.path.join(FALCONKV_TEST_LOG_DIR, file_stem, test_name)
+    os.makedirs(log_dir, exist_ok=True)
+    return log_dir
+
+
+# ---------------------------------------------------------------------------
 # Fixture: Meta server
 # ---------------------------------------------------------------------------
 @pytest.fixture
-def meta_server(temp_ssd_dir):
+def meta_server(temp_ssd_dir, test_log_dir):
     """Start and stop the FalconKV Meta server (falconkv_master).
 
     Yields a dict with connection info.
@@ -88,10 +107,13 @@ def meta_server(temp_ssd_dir):
 
     listen_port = 18900
     config = {
+        "common": {
+            "log_dir": test_log_dir,
+        },
         "meta": {
             "listen_addr": f"0.0.0.0:{listen_port}",
             "shard_count": 16,
-        }
+        },
     }
     config_file = os.path.join(temp_ssd_dir, "meta_config.json")
     _write_config(config_file, config)
@@ -128,7 +150,7 @@ def meta_server(temp_ssd_dir):
 # Fixture: Scheduler server
 # ---------------------------------------------------------------------------
 @pytest.fixture
-def scheduler_server(temp_ssd_dir):
+def scheduler_server(temp_ssd_dir, test_log_dir):
     """Start and stop the FalconKV Scheduler server (falconkv_sched).
 
     Yields a dict with connection info.
@@ -138,11 +160,14 @@ def scheduler_server(temp_ssd_dir):
 
     uds_path = os.path.join(temp_ssd_dir, "scheduler.sock")
     config = {
+        "common": {
+            "log_dir": test_log_dir,
+            "scheduler_uds_path": uds_path,
+        },
         "scheduler": {
-            "uds_path": uds_path,
             "schedule_policy": "passthrough",
-            "enabled": True,
-        }
+            "stats_report_interval_sec": 2,
+        },
     }
     config_file = os.path.join(temp_ssd_dir, "sched_config.json")
     _write_config(config_file, config)
@@ -180,7 +205,7 @@ def scheduler_server(temp_ssd_dir):
 # Fixture: FalconKV Python client
 # ---------------------------------------------------------------------------
 @pytest.fixture
-def falconkv_client(meta_server, temp_ssd_dir):
+def falconkv_client(meta_server, temp_ssd_dir, test_log_dir):
     """Create a FalconKV Python client connected to the running Meta.
 
     Requires pyfalconkv to be installed. Yields a Client instance.
@@ -194,6 +219,7 @@ def falconkv_client(meta_server, temp_ssd_dir):
         "common": {
             "meta_addr": meta_server["addr"],
             "scheduler_enabled": False,
+            "log_dir": test_log_dir,
         },
         "meta": {
             "listen_addr": meta_server["addr"],
@@ -216,11 +242,16 @@ def falconkv_client(meta_server, temp_ssd_dir):
 
 def _make_falconkv_config(
     ssd_dir,
+    log_dir=FALCONKV_TEST_LOG_DIR,
     store_id=1,
     node_id=1,
     meta_addr="127.0.0.1:18900",
     capacity_gb=1,
-    chunk_size=2 * 1024 * 1024,
+    evict_grace_period_ms=None,
+    evict_check_interval_sec=None,
+    evict_high_watermark=None,
+    evict_low_watermark=None,
+    evict_cold_threshold_ms=None,
 ):
     """Generate a FalconKV JSON config file and return its path.
 
@@ -229,33 +260,42 @@ def _make_falconkv_config(
     """
     # Assign a unique listen_port per store_id to avoid collisions
     listen_port = 18901 + (store_id - 1) * 10
+    store_cfg = {
+        "ssd_path": ssd_dir,
+        "store_id": store_id,
+        "capacity_gb": capacity_gb,
+        "page_size": 4096,
+        "io_threads": 2,
+        "buffer_pool_size": 4,
+        "store_rpc_host": "127.0.0.1",
+        "listen_port": listen_port,
+    }
+    # Conditionally add evict parameters when provided.
+    if evict_grace_period_ms is not None:
+        store_cfg["evict_grace_period_ms"] = evict_grace_period_ms
+    if evict_check_interval_sec is not None:
+        store_cfg["evict_check_interval_sec"] = evict_check_interval_sec
+    if evict_high_watermark is not None:
+        store_cfg["evict_high_watermark"] = evict_high_watermark
+    if evict_low_watermark is not None:
+        store_cfg["evict_low_watermark"] = evict_low_watermark
+    if evict_cold_threshold_ms is not None:
+        store_cfg["evict_cold_threshold_ms"] = evict_cold_threshold_ms
+
     config = {
         "common": {
             "meta_addr": meta_addr,
             "node_id": node_id,
             "scheduler_enabled": False,
             "scheduler_uds_path": "/tmp/nonexistent.sock",
+            "log_dir": log_dir,
         },
-        "store": {
-            "ssd_path": ssd_dir,
-            "store_id": store_id,
-            "capacity_gb": capacity_gb,
-            "chunk_size": chunk_size,
-            "page_size": 4096,
-            "io_threads": 2,
-            "buffer_pool_size": 4,
-            "store_rpc_host": "127.0.0.1",
-            "listen_port": listen_port,
-        },
+        "store": store_cfg,
         "client": {
             "cache_capacity": 100000,
-            "log_dir": ssd_dir,
         },
         "meta": {
             "listen_addr": meta_addr,
-        },
-        "scheduler": {
-            "enabled": False,
         },
     }
     config_path = os.path.join(ssd_dir, "falconkv_config.json")
@@ -318,9 +358,12 @@ def memory_allocator():
 
 
 @pytest.fixture
-def make_falconkv_config():
-    """Provide _make_falconkv_config as a fixture-returnable callable."""
-    return _make_falconkv_config
+def make_falconkv_config(test_log_dir):
+    """Provide _make_falconkv_config with log_dir pre-bound to test_log_dir."""
+    def _make(*args, **kwargs):
+        kwargs.setdefault("log_dir", test_log_dir)
+        return _make_falconkv_config(*args, **kwargs)
+    return _make
 
 
 @pytest.fixture

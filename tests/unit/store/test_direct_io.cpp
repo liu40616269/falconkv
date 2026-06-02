@@ -34,7 +34,6 @@ protected:
         config.store_id = 0;
         // Small capacity for tests (4 MB).
         config.capacity_bytes = 4 * 1024 * 1024;
-        config.chunk_size = 4096;
         config.page_size = 4096;
         config.io_threads = 2;
         config.disable_mtime = true;

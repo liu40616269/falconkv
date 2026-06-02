@@ -96,7 +96,6 @@ void MetaServiceImpl::StoreRegister(::google::protobuf::RpcController*,
     info.store_addr = request->node_host() + ":" +
                       std::to_string(request->node_port());
     info.data_file = request->data_file();
-    info.chunk_size = request->chunk_size();
 
     Status status = meta_manager_->RegisterStore(info);
     response->set_status(status.ok() ? 0 : static_cast<int>(status.code()));

@@ -14,20 +14,8 @@ FalconKVBridge::FalconKVBridge(const Config& config) {
         cfg = ConfigLoader::LoadFromFile(config.config_file);
     }
 
-    // 初始化 glog（FLAGS 必须在 InitGoogleLogging 之前设置）
-#ifdef FALCONKV_HAS_GLOG
-    if (!cfg.client.log_dir.empty()) {
-        FLAGS_log_dir = cfg.client.log_dir;
-    } else {
-        FLAGS_logtostderr = true;
-    }
-    FLAGS_minloglevel = 0;  // 输出 INFO 及以上
-    static bool glog_initialized = false;
-    if (!glog_initialized) {
-        google::InitGoogleLogging("falconkv_client");
-        glog_initialized = true;
-    }
-#endif
+    // 初始化共享日志（InitSharedLogging 内部保证 google::InitGoogleLogging 只执行一次）
+    falconkv::InitSharedLogging(cfg.common.log_dir, "falconkv_client");
 
     // 创建并初始化 FalconKVStore
     store_ = std::make_unique<FalconKVStore>(
@@ -69,10 +57,7 @@ FalconKVBridge::FalconKVBridge(const Config& config) {
 
 FalconKVBridge::~FalconKVBridge() {
     Close();
-#ifdef FALCONKV_HAS_GLOG
-    // 不主动 ShutdownGoogleLogging，避免其他实例的日志失效
-    // google::ShutdownGoogleLogging();
-#endif
+    // 不主动 ShutdownSharedLogging，避免其他实例的日志失效
 }
 
 int FalconKVBridge::BatchExistSync(const std::vector<std::string>& keys) {

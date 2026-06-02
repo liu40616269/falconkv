@@ -59,14 +59,17 @@ class TestSchedulerIntegration:
         adapter = FalconKVConnectorAdapter()
         assert adapter.can_parse("falconkv://localhost:0")
 
-    def test_meta_server_port_release(self, temp_ssd_dir):
+    def test_meta_server_port_release(self, temp_ssd_dir, test_log_dir):
         """IT-SC-004: Meta server releases port after SIGTERM, can restart."""
         falconkv_master = os.path.join(BUILD_DIR, "src", "meta", "falconkv_master")
         if not os.path.isfile(falconkv_master):
             pytest.skip("falconkv_master not found")
 
         port = 18901
-        config = {"meta": {"listen_addr": f"0.0.0.0:{port}", "shard_count": 16}}
+        config = {
+            "common": {"log_dir": test_log_dir},
+            "meta": {"listen_addr": f"0.0.0.0:{port}", "shard_count": 16},
+        }
         config_file = os.path.join(temp_ssd_dir, "meta_restart_config.json")
         with open(config_file, "w") as f:
             json.dump(config, f)

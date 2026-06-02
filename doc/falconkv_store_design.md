@@ -1109,25 +1109,37 @@ ioctl(fd, FS_IOC_FSSETXATTR, &fsx);
 
 ## 11. 配置项
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `store_ssd_path` | /data/falconkv | SSD 数据根目录 |
+Store 配置分为两部分：**common 区共享配置**（自动传播到所有模块）和 **store 区专属配置**。
+
+### 11.1 common 区（共享，自动传播）
+
+| JSON 字段 (`common.*`) | 默认值 | 说明 |
+|------------------------|--------|------|
+| `meta_addr` | localhost:18900 | Meta 服务器地址，自动传播到 `store.meta_addr` |
+| `node_id` | 0 | 节点 ID，自动传播到 `store.node_id` |
+| `scheduler_enabled` | true | 是否启用 Scheduler 上报，自动传播到 `store.scheduler_enabled` |
+| `scheduler_uds_path` | /tmp/falconkv_scheduler.sock | Scheduler UDS 路径，自动传播到 `store.scheduler_uds_path` |
+| `scheduler_rpc_timeout_us` | 2000 | Scheduler RPC 超时（微秒），自动传播到 `store.scheduler_rpc_timeout_us` |
+| `max_consecutive_failures` | 3 | Scheduler 连续失败阈值，自动传播到 `store.max_consecutive_failures` |
+| `reconnect_interval_sec` | 2 | Scheduler 重连间隔，自动传播到 `store.reconnect_interval_sec` |
+| `log_dir` | "" | glog 日志目录，空则输出到 stderr |
+
+### 11.2 store 区（专属）
+
+| JSON 字段 (`store.*`) | 默认值 | 说明 |
+|------------------------|--------|------|
+| `ssd_path` | /data/falconkv | SSD 数据根目录 |
 | `store_id` | 0 | Store 唯一标识 |
-| `store_capacity_gb` | 500 | Store 容量（GB） |
-| `store_chunk_size` | 2097152 | KV 块大小（2MB） |
-| `store_page_size` | 4096 | 页大小 |
-| `store_io_threads` | 4 | IO 工作线程数 |
-| `store_alignment` | 512 | DirectIO 对齐大小 |
-| `store_disable_mtime` | true | 禁用文件修改时间更新 |
-| `store_use_io_uring` | false | 是否使用 io_uring |
-| `store_listen_port` | 8901 | Store RPC 监听端口 |
-| `store_heartbeat_sec` | 5 | 心跳间隔 |
-| `store_buffer_pool_size` | 64 | 对齐 buffer 池大小 |
-| `store_scheduler_enabled` | true | 是否启用 Scheduler 上报 |
-| `store_scheduler_uds_path` | /tmp/falconkv_scheduler.sock | Scheduler UDS 路径 |
-| `store_meta_addr` | localhost:8900 | Meta 服务器地址 |
-| `store_evict_interval_sec` | 60 | 驱逐扫描间隔 |
-| `store_evict_high_watermark` | 0.85 | 驱逐触发水位 |
-| `store_evict_low_watermark` | 0.70 | 驱逐目标水位 |
-| `store_evict_grace_period_ms` | 5000 | 驱逐宽限期（Meta 删除后延迟回收本地空间的时间） |
-| `store_sync_batch_size` | 256 | SyncCommit 单次最大 key 数量 |
+| `capacity_gb` | 5 | Store 容量（GB） |
+| `page_size` | 4096 | 页大小 |
+| `io_threads` | 4 | IO 工作线程数 |
+| `alignment` | 512 | DirectIO 对齐大小 |
+| `listen_port` | 8901 | Store RPC 监听端口 |
+| `heartbeat_sec` | 5 | 心跳间隔（秒） |
+| `buffer_pool_size` | 64 | 对齐 buffer 池大小 |
+| `store_rpc_host` | 127.0.0.1 | Store RPC 监听主机 |
+| `evict_grace_period_ms` | 5000 | 驱逐宽限期（Meta 删除后延迟回收本地空间的时间） |
+| `evict_check_interval_sec` | 60 | 驱逐扫描间隔（秒） |
+| `evict_high_watermark` | 0.85 | 驱逐触发水位 |
+| `evict_low_watermark` | 0.70 | 驱逐目标水位 |
+| `evict_cold_threshold_ms` | 300000 | 冷数据判定阈值（毫秒） |

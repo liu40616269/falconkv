@@ -413,8 +413,9 @@ public:
 
 ## 9. 部署配置
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `meta.listen_addr` | 0.0.0.0:8900 | Meta RPC 监听地址 |
-| `meta.shard_count` | 64 | 元数据分片数 |
-| `meta.heartbeat_timeout_sec` | 30 | Client 心跳超时 |
+| JSON 字段 (`meta.*`) | 默认值 | 说明 |
+|------------------------|--------|------|
+| `listen_addr` | 0.0.0.0:18900 | Meta RPC 监听地址 |
+| `shard_count` | 64 | 元数据分片数 |
+| `page_size` | 4096 | 页大小 |
+| `heartbeat_timeout_sec` | 30 | Client 心跳超时（秒） |

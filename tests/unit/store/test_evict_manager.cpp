@@ -11,31 +11,37 @@ using namespace falconkv;
 // ---------------------------------------------------------------------------
 TEST(EvictManagerTest, ColdEntrySelectionAndEviction) {
     StoreMetaIndex idx;
-    BuddyAllocator alloc(4096 * 64, 4096, 1);
+    BuddyAllocator alloc(4096 * 64, 4096);
 
     // Allocate space for each entry (simulating what FalconKVStore.Put does)
     std::vector<int64_t> offsets;
+    std::vector<uint32_t> alloc_sizes;
     for (int i = 0; i < 10; ++i) {
-        int64_t off = alloc.AllocChunk();
+        uint32_t as = 0;
+        int64_t off = alloc.Alloc(100, &as);
         ASSERT_GE(off, 0);
         offsets.push_back(off);
+        alloc_sizes.push_back(as);
 
         StoreKeyRecord rec;
         rec.key = "cold" + std::to_string(i);
         rec.offset = static_cast<uint64_t>(off);
         rec.size = 100;
+        rec.alloc_size = as;
         rec.stat = 1;
         rec.access_time_ms = 1000;
         idx.Put(rec.key, rec);
     }
 
     // Insert a hot entry that should NOT be evicted
-    int64_t hot_off = alloc.AllocChunk();
+    uint32_t hot_as = 0;
+    int64_t hot_off = alloc.Alloc(100, &hot_as);
     ASSERT_GE(hot_off, 0);
     StoreKeyRecord hot;
     hot.key = "hot";
     hot.offset = static_cast<uint64_t>(hot_off);
     hot.size = 100;
+    hot.alloc_size = hot_as;
     hot.stat = 1;
     hot.access_time_ms = 9999999999ULL;  // much larger than threshold
     idx.Put("hot", hot);
@@ -57,7 +63,7 @@ TEST(EvictManagerTest, ColdEntrySelectionAndEviction) {
     // 3. Remove from local index and enqueue for deferred reclamation
     for (const auto& rec : cold) {
         idx.Remove(rec.key);
-        pending_queue.Enqueue(rec.key, rec.offset);
+        pending_queue.Enqueue(rec.key, rec.offset, rec.alloc_size);
     }
 
     // The hot entry should still be in the index
@@ -131,17 +137,19 @@ TEST(EvictManagerTest, BatchSizeLimit) {
 // ---------------------------------------------------------------------------
 TEST(EvictManagerTest, HighWatermarkTriggersEviction) {
     StoreMetaIndex idx;
-    BuddyAllocator alloc(4096 * 20, 4096, 1);
+    BuddyAllocator alloc(4096 * 20, 4096);
 
-    // Fill to > 85% usage (17 of 20 chunks).
+    // Fill to > 85% usage (18 of 20 pages).
     for (int i = 0; i < 18; ++i) {
-        int64_t off = alloc.AllocChunk();
+        uint32_t as = 0;
+        int64_t off = alloc.Alloc(4096, &as);
         ASSERT_GE(off, 0);
 
         StoreKeyRecord rec;
         rec.key = "key" + std::to_string(i);
         rec.offset = static_cast<uint64_t>(off);
         rec.size = 4096;
+        rec.alloc_size = as;
         rec.stat = 1;
         rec.access_time_ms = 1000; // cold
         idx.Put(rec.key, rec);
@@ -161,7 +169,7 @@ TEST(EvictManagerTest, HighWatermarkTriggersEviction) {
 
     for (const auto& rec : cold) {
         idx.Remove(rec.key);
-        pending_queue.Enqueue(rec.key, rec.offset);
+        pending_queue.Enqueue(rec.key, rec.offset, rec.alloc_size);
     }
 
     pending_queue.Stop();
@@ -176,17 +184,19 @@ TEST(EvictManagerTest, HighWatermarkTriggersEviction) {
 // ---------------------------------------------------------------------------
 TEST(EvictManagerTest, BelowHighWatermarkNoEviction) {
     StoreMetaIndex idx;
-    BuddyAllocator alloc(4096 * 100, 4096, 1);
+    BuddyAllocator alloc(4096 * 100, 4096);
 
-    // Fill only 10 chunks out of 100 (10% usage, well below 85%).
+    // Fill only 10 pages out of 100 (10% usage, well below 85%).
     for (int i = 0; i < 10; ++i) {
-        int64_t off = alloc.AllocChunk();
+        uint32_t as = 0;
+        int64_t off = alloc.Alloc(4096, &as);
         ASSERT_GE(off, 0);
 
         StoreKeyRecord rec;
         rec.key = "key" + std::to_string(i);
         rec.offset = static_cast<uint64_t>(off);
         rec.size = 4096;
+        rec.alloc_size = as;
         rec.stat = 1;
         rec.access_time_ms = 1000;
         idx.Put(rec.key, rec);

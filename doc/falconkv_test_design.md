@@ -20,11 +20,11 @@
 | Meta | 24 | 5 | 参与全链路 |
 | Store | 30 | 5 | 参与全链路 |
 | Transfer | 14 | 5 | 参与全链路 |
-| Scheduler | 25 | 4 | 4 |
+| Scheduler | 25 | 4 | 7 |
 | Bypass | 10 | 3 | 2 |
 | 服务启动 | - | - | 6 |
 | LMCache 适配 | - | 4 | - |
-| **合计** | **125** | **32** | **34** |
+| **合计** | **125** | **32** | **37** |
 
 ---
 
@@ -480,7 +480,7 @@
 |------|--------|----------|----------|
 | IT-FN-001 | 单 key 往返 | put → get | 数据一致 |
 | IT-FN-002 | 多 key 往返 | put 10 key → get | 全部一致 |
-| IT-FN-003 | 覆盖 key | put key → put 同 key 新值 → get | 返回新值 |
+| IT-FN-003 | 重复 put 跳过 | put key → put 同 key 新值 → get | 第二次 put 被跳过，get 返回首次写入的值 |
 | IT-FN-004 | 获取不存在 key | get 未 put key | 返回空 |
 | IT-FN-005 | 大值 | put 256KB 数据 → get | 数据一致 |
 
@@ -497,7 +497,7 @@
 | 编号 | 测试项 | 测试步骤 | 预期结果 |
 |------|--------|----------|----------|
 | IT-FN-009 | 连续写入 100 key | put 100 key → get 100 key | 全部一致 |
-| IT-FN-010 | 最新写入覆盖 | put → put 新值 → get | 返回新值 |
+| IT-FN-010 | 重复 put 跳过 | put key → put 同 key 新值 ×4 → get | 后续 put 均被跳过，get 始终返回首次写入的值 |
 
 **TestClientLifecycle** — 客户端生命周期。
 
@@ -532,6 +532,25 @@
 | IT-SCH-003 | Scheduler 停止后 bypass | 停止 Scheduler → Client IO | 自动 bypass |
 | IT-SCH-004 | Meta 端口释放 | 停止 Meta → 重启 | 新进程绑定同一端口 |
 
+### 8.6 Store 驱逐 + Scheduler 统计集成测试 (`tests/integration/test_evict_and_scheduler_e2e.py`)
+
+**前置条件**：启动 Meta Server（falconkv_master）和 Scheduler Server（falconkv_sched），安装 pyfalconkv。
+
+#### TestStoreEviction — Store 容量耗尽后驱逐回收
+
+| 编号 | 测试项 | 测试步骤 | 预期结果 |
+|------|--------|----------|----------|
+| IT-EV-001 | 驱逐释放空间 | 写入 ~830 个 1MB key 超过 80% 高水位 → 等待驱逐 → 写入新 key | 新 key 写入成功，部分旧 key 被驱逐 |
+
+#### TestSchedulerStats — Scheduler 统计收集（通过 Client API 触发）
+
+Client 配置 `scheduler_enabled=true`，Client 内部的 SchedulerProxy 通过 brpc UDS 自动向 Scheduler 发送 RequestIO + ReportIOCompletion RPC。
+
+| 编号 | 测试项 | 测试步骤 | 预期结果 |
+|------|--------|----------|----------|
+| IT-STAT-001 | 本地 SSD 读写统计 | Client batch_put 20 key → batch_get → 检查 Scheduler 日志 | 日志含 `local_ssd_write` 和 `local_ssd_read` 统计，ios > 0 |
+| IT-STAT-002 | 网络发送读统计 | 两个 Client（不同 node_id）分别写和读 → 检查 Scheduler 日志 | 日志含 `net_tx_read` 统计，ios > 0 |
+
 ---
 
 ## 9. 性能基准测试
@@ -551,7 +570,141 @@
 
 ---
 
-## 10. 异常与边界测试
+## 10. 多节点端到端性能测试
+
+### 10.1 概述
+
+多 Client（同节点 / 跨节点）并发批量读写性能测试。验证 FalconKV 在多 Client 并发场景下的吞吐量和延迟分布，覆盖三种读取路径：
+
+- **ACCESS_LOCAL_DIRECT**：Client 读写自身绑定 Store（本地 DirectIO）
+- **ACCESS_NODE_DIRECT**：同节点不同 Store 之间的 DirectIO 直读
+- **ACCESS_REMOTE_RPC**：跨节点 Store RPC 远程读取
+
+### 10.2 配置设计
+
+统一配置文件 `perf_config.json`，包含五段：
+
+```json
+{
+  "test": {
+    "duration_sec": 30,
+    "batch_size": 8,
+    "value_size": 4096,
+    "shared_key_ratio": 0.3,
+    "warmup_sec": 3,
+    "meta_listen_port": 18900,
+    "scheduler_uds_path": "/tmp/falconkv_perf_sched.sock",
+    "result_dir": "/tmp/falconkv_perf_result"
+  },
+  "meta": {
+    "shard_count": 16
+  },
+  "scheduler": {
+    "schedule_policy": "passthrough",
+    "enabled": false
+  },
+  "clients": [
+    {
+      "client_id": "A",
+      "node_id": 1,
+      "store_id": 1,
+      "listen_port": 18901,
+      "ssd_path": "/tmp/falconkv_perf_ssd/A",
+      "capacity_gb": 1,
+      "cache_capacity": 100000,
+      "io_threads": 2,
+      "buffer_pool_size": 4,
+      "store_rpc_host": "127.0.0.1"
+    },
+    ...
+  ],
+  "transfer": {
+    "meta_addr": "127.0.0.1:18900"
+  }
+}
+```
+
+各段说明：
+
+| 段 | 用途 |
+|----|------|
+| `test` | 测试参数：持续时间、批量大小、值大小、共享 key 比例、预热时长 |
+| `meta` | Meta 服务配置 |
+| `scheduler` | Scheduler 配置（默认 disabled） |
+| `clients` | 每个 Client 定义：client_id, node_id, store_id, listen_port, ssd_path, capacity_gb 等 |
+| `transfer` | 传输层配置 |
+
+### 10.3 测试流程
+
+每个 `perf_client.py` 进程执行以下流程：
+
+**Warmup 阶段**：
+- 写入一批预热数据，让 Meta 同步完成
+- 等待 `warmup_sec` 秒确保所有 Client 的数据在 Meta 可见
+
+**主测试阶段**（循环 `duration_sec` 秒）：
+1. 生成一批 key（`batch_size` 个）
+2. `batch_exist` 检查 key 存在性，记录延迟
+3. `batch_put` 写入数据，记录延迟
+4. `batch_get` 读回数据，记录延迟
+
+**Key 策略**：
+- `shared_key_ratio`（默认 0.3）控制共享 key 比例
+- 30% 共享 key（`perf_shared_{i}` 前缀）→ 跨 Client 可见，触发跨 Store/跨节点读取
+- 70% 独占 key（`perf_{client_id}_{i}` 前缀）→ 仅自身可见
+
+**共享 key 路径**：
+- Client A 写入 `perf_shared_*` → Store 1 (node 1)
+- Client B（同 node）读取走 `ACCESS_NODE_DIRECT`
+- Client C（不同 node）读取走 `ACCESS_REMOTE_RPC`
+
+### 10.4 采集指标
+
+每操作类型（exist / put / get）采集：
+
+| 指标 | 说明 |
+|------|------|
+| `total_ops` | 总操作次数 |
+| `avg_ms` | 平均延迟 |
+| `p50_ms` / `p95_ms` / `p99_ms` / `max_ms` / `min_ms` | 百分位延迟 |
+| `throughput_ops` | 吞吐量 (ops/s) |
+| `throughput_mb` | 吞吐量 (MB/s) |
+| `errors` | 错误次数 |
+
+### 10.5 结果汇总
+
+`perf_aggregate.py` 读取各 Client 的 `result_{client_id}.json`，打印汇总表格：
+
+```
+==================== Performance Summary ====================
+Client | Op     | Total | Avg(ms) | P50(ms) | P99(ms) | Ops/s   | MB/s
+-------|--------|-------|---------|---------|---------|---------|------
+A      | exist  |  1200 |   0.35  |   0.30  |   0.85  |   40.0  |  0.0
+A      | put    |  1200 |   1.20  |   1.10  |   3.50  |   40.0  |  0.2
+A      | get    |  1200 |   0.50  |   0.45  |   1.20  |   40.0  |  0.2
+B      | exist  |  1200 |   0.38  |   0.32  |   0.90  |   40.0  |  0.0
+...
+```
+
+同时输出 `summary.json` 供程序化分析。
+
+### 10.6 一键启动
+
+`run_perf.sh` 一键启动脚本流程：
+
+1. 解析 `perf_config.json`
+2. 创建必要的 SSD 和结果目录
+3. 启动 Meta → 等待端口就绪
+4. 启动 Scheduler → 等待 UDS 就绪
+5. 并行启动所有 `perf_client.py` 进程
+6. `wait` 等待所有 Client 完成
+7. 停止 Meta / Scheduler
+8. 调用 `perf_aggregate.py` 汇总
+9. `trap cleanup EXIT` 确保进程清理
+
+---
+
+## 11. 异常与边界测试
 
 | 编号 | 测试项 | 测试步骤 | 预期结果 |
 |------|--------|----------|----------|
@@ -559,7 +712,7 @@
 | EDGE-002 | Store 不可达时写入 | 停止目标 Store | 返回错误 |
 | EDGE-003 | 空 keys 列表 | BatchExist([]) | 返回 hit_count=0，无 RPC |
 | EDGE-004 | 超大 batch（1000 keys） | BatchPut 1000 个 key | 全部成功，无超时 |
-| EDGE-005 | 重复 key 写入 | BatchPut 同一个 key 两次 | 第二次分配新空间，旧空间待驱逐 |
+| EDGE-005 | 重复 key 写入 | BatchPut 同一个 key 两次 | 第二次被跳过（key 已存在），不分配新空间，打印 INFO 日志 |
 | EDGE-006 | SSD 文件不存在时 Store 启动 | 删除数据文件后启动 Store | 自动创建文件并 fallocate |
 | EDGE-007 | SSD 空间不足 | 写入超出 capacity | 返回 ENOSPC，已有数据不受影响 |
 | EDGE-008 | Meta 重启恢复 | 重启 Meta | 重新连接后恢复正常 |
@@ -568,9 +721,9 @@
 
 ---
 
-## 11. 测试基础设施
+## 12. 测试基础设施
 
-### 11.1 目录结构
+### 12.1 目录结构
 
 ```
 falconkv/
@@ -620,10 +773,16 @@ falconkv/
 │       ├── test_falconkv_connector_e2e.py  # LMCache RemoteBackend 三级读取
 │       ├── test_functional_e2e.py     # 功能正确性（Python Client）
 │       ├── test_lmcache_adapter.py    # LMCache Adapter 自动发现
-│       └── test_scheduler_integration.py  # Scheduler 进程级集成
+│       ├── test_scheduler_integration.py  # Scheduler 进程级集成
+│       └── test_evict_and_scheduler_e2e.py  # Store 驱逐 + Scheduler 统计集成测试
+│   └── perf/                            # 端到端性能测试
+│       ├── perf_config.json             # 性能测试配置
+│       ├── perf_client.py               # 单 Client 工作进程
+│       ├── perf_aggregate.py            # 结果汇总脚本
+│       └── run_perf.sh                  # 一键启动脚本
 ```
 
-### 11.2 测试依赖
+### 12.2 测试依赖
 
 | 依赖 | 用途 | 版本建议 |
 |------|------|----------|
@@ -635,7 +794,7 @@ falconkv/
 | LMCache | FalconKVConnector 适配测试 | v0.3.12 |
 | PyTorch | LMCache 测试 tensor 分配 | 2.0+ |
 
-### 11.3 Mock 策略
+### 12.3 Mock 策略
 
 | 被测模块 | Mock 对象 | Mock 方式 |
 |----------|-----------|-----------|
@@ -644,7 +803,7 @@ falconkv/
 | Scheduler 模块测试 | UDS brpc Server | 真实 brpc Server on UDS |
 | LMCache Adapter | LMCache RemoteConnector | 真实类层次，无外部进程 |
 
-### 11.4 运行命令
+### 12.4 运行命令
 
 ```bash
 # C++ 单元 + 模块测试（无外部进程依赖，32 个 test binary）
@@ -661,9 +820,13 @@ pytest tests/integration/test_functional_e2e.py -v
 
 # 服务启动测试
 pytest tests/integration/test_e2e_batch_ops.py -v
+
+# 端到端性能测试（一键启动 Meta + Scheduler + 多 Client）
+chmod +x tests/perf/run_perf.sh
+./tests/perf/run_perf.sh tests/perf/perf_config.json
 ```
 
-### 11.5 测试标记
+### 12.5 测试标记
 
 | 标记 | 说明 | CI 是否运行 |
 |------|------|------------|
@@ -671,9 +834,9 @@ pytest tests/integration/test_e2e_batch_ops.py -v
 
 ---
 
-## 12. 附录
+## 13. 附录
 
-### 12.1 测试覆盖率目标
+### 13.1 测试覆盖率目标
 
 | 模块 | 行覆盖率目标 | 分支覆盖率目标 |
 |------|------------|--------------|
@@ -684,7 +847,7 @@ pytest tests/integration/test_e2e_batch_ops.py -v
 | Scheduler | ≥ 80% | ≥ 70% |
 | Python Connector | ≥ 80% | ≥ 70% |
 
-### 12.2 测试与设计文档对应关系
+### 13.2 测试与设计文档对应关系
 
 | 设计文档 | 本文档覆盖章节 |
 |----------|--------------|
@@ -693,4 +856,4 @@ pytest tests/integration/test_e2e_batch_ops.py -v
 | falconkv_store_design.md | 第 4 节（Store 测试） |
 | falconkv_transfer_design.md | 第 5 节（Transfer 测试） |
 | falconkv_scheduler_design.md | 第 6 节（Scheduler 测试）+ 第 7 节（Bypass 测试） |
-| falconkv_design.md（全局） | 第 8 节（集成测试）+ 第 9 节（性能测试）+ 第 10 节（边界测试） |
+| falconkv_design.md（全局） | 第 8 节（集成测试）+ 第 9 节（性能测试）+ 第 10 节（多节点性能测试）+ 第 11 节（边界测试） |

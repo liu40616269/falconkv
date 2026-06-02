@@ -37,7 +37,6 @@ protected:
         config.store_id = 1;
         config.node_id = 1;
         config.capacity_bytes = 16 * 1024 * 1024; // 16 MB
-        config.chunk_size = 4096;
         config.page_size = 4096;
         config.disable_mtime = true;
         config.scheduler_enabled = false;

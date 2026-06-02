@@ -3,7 +3,11 @@
         "meta_addr": "localhost:18900",
         "node_id": 1,
         "scheduler_enabled": true,
-        "scheduler_uds_path": "/tmp/falconkv_scheduler.sock"
+        "scheduler_uds_path": "/tmp/falconkv_scheduler.sock",
+        "scheduler_rpc_timeout_us": 2000,
+        "max_consecutive_failures": 3,
+        "reconnect_interval_sec": 2,
+        "log_dir": ""
     },
     "meta": {
         "listen_addr": "0.0.0.0:18900",
@@ -14,8 +18,7 @@
     "store": {
         "ssd_path": "/data/falconkv",
         "store_id": 0,
-        "capacity_gb": 500,
-        "chunk_size": 2097152,
+        "capacity_gb": 5,
         "page_size": 4096,
         "io_threads": 4,
         "alignment": 512,
@@ -30,24 +33,18 @@
         "evict_cold_threshold_ms": 300000
     },
     "scheduler": {
-        "enabled": true,
         "schedule_policy": "passthrough",
         "ssd_bw_limit_mbps": 7000,
         "net_bw_limit_mbps": 12500,
         "stats_report_interval_sec": 5,
-        "stats_window_ms": 1000,
-        "rpc_timeout_us": 100,
-        "max_consecutive_failures": 3,
-        "reconnect_interval_sec": 2
+        "stats_window_ms": 1000
     },
     "client": {
         "cache_capacity": 100000,
         "async_batch_size": 16,
         "fire_and_forget": true,
         "preallocation_count": 1000,
-        "preallocation_enabled": true,
-        "scheduler_rpc_timeout_us": 100,
-        "log_dir": ""
+        "preallocation_enabled": true
     },
     "transfer": {
         "protocol": "brpc",

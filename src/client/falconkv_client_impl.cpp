@@ -22,6 +22,10 @@ FalconKVClientImpl::FalconKVClientImpl(const Config& config)
         node_id_ = cfg.store.node_id;
     }
 
+    // Compute local store address for remote-read source identification
+    local_store_addr_ = cfg.store.store_rpc_host + ":"
+                        + std::to_string(cfg.store.listen_port);
+
     // Connect to remote Meta server via RPC
     Status meta_status = meta_client_.Connect(cfg.transfer.meta_addr);
     if (!meta_status.ok()) {
@@ -30,10 +34,22 @@ FalconKVClientImpl::FalconKVClientImpl(const Config& config)
                      << " (will retry via background reconnect loop)";
     }
 
-    // Initialize SchedulerProxy if enabled
-    scheduler_enabled_ = config_.scheduler_enabled;
+    // Initialize SchedulerProxy if enabled.
+    // Prefer settings from the loaded JSON config when a config file is given.
+    bool sched_enabled = config_.scheduler_enabled;
+    std::string sched_uds = config_.scheduler_uds_path;
+    if (!config_.config_file.empty()) {
+        sched_enabled = cfg.common.scheduler_enabled;
+        if (!cfg.common.scheduler_uds_path.empty()) {
+            sched_uds = cfg.common.scheduler_uds_path;
+        }
+    }
+    scheduler_enabled_ = sched_enabled;
     if (scheduler_enabled_) {
-        scheduler_proxy_ = std::make_unique<SchedulerProxy>(config_.scheduler_uds_path);
+        scheduler_proxy_ = std::make_unique<SchedulerProxy>(sched_uds,
+                                                             cfg.client.scheduler_rpc_timeout_us / 1000,
+                                                             cfg.client.max_consecutive_failures,
+                                                             cfg.client.reconnect_interval_sec);
     }
 
     // Start background reconnect loop for Meta RPC client.
@@ -71,7 +87,8 @@ Status FalconKVClientImpl::DoRead(const KeyDescriptor& desc,
                 return Status::RpcError(
                     "no RPC client for store " + std::to_string(desc.store_id));
             }
-            return rpc->Read(desc.offset, buffer, size);
+            return rpc->Read(desc.offset, buffer, size,
+                             node_id_, local_store_addr_);
         }
 
         default:
@@ -132,12 +149,10 @@ int FalconKVClientImpl::BatchExist(const std::vector<std::string>& keys,
         local_store_->BatchContains(keys, store_hits, missing_keys);
 
         for (const auto& rec : store_hits) {
-            KeyDescriptor desc;
-            desc.key = rec.key;
+            KeyDescriptor desc(rec.key);
             desc.store_id = local_store_->store_id();
             desc.offset = rec.offset;
             desc.size = rec.size;
-            desc.chunk_size = rec.chunk_size;
             desc.access_type = AccessType::ACCESS_LOCAL_DIRECT;
             hit_descs.push_back(desc);
             key_desc_cache_.Insert(rec.key, desc);
@@ -151,8 +166,7 @@ int FalconKVClientImpl::BatchExist(const std::vector<std::string>& keys,
         auto records = meta_client_.BatchExist(missing_keys);
         for (size_t i = 0; i < records.size(); ++i) {
             if (!records[i].key.empty() && records[i].stat == 1) {
-                KeyDescriptor desc;
-                desc.key = records[i].key;
+                KeyDescriptor desc(records[i].key);
                 desc.store_id = records[i].store_id;
                 desc.offset = records[i].offset;
                 desc.size = records[i].size;
@@ -252,13 +266,10 @@ std::vector<Status> FalconKVClientImpl::BatchPut(
         statuses[i] = results[i].status;
 
         if (results[i].status.ok()) {
-            KeyDescriptor desc;
-            desc.key = keys[i];
+            KeyDescriptor desc(keys[i]);
             desc.store_id = local_store_->store_id();
             desc.offset = results[i].offset;
             desc.size = buffers[i].size;
-            desc.chunk_size = results[i].chunk_size;
-            desc.data_file = local_store_->data_file();
             desc.access_type = AccessType::ACCESS_LOCAL_DIRECT;
             key_desc_cache_.Insert(keys[i], desc);
         }
@@ -290,8 +301,7 @@ std::vector<int32_t> FalconKVClientImpl::BatchGet(
                   << " store_id=" << desc.store_id
                   << " offset=" << desc.offset
                   << " size=" << desc.size
-                  << " access_type=" << static_cast<int>(desc.access_type)
-                  << " data_file=" << desc.data_file;
+                  << " access_type=" << static_cast<int>(desc.access_type);
 
         int channel = ChannelForAccessType(desc.access_type);
         uint32_t store_id = desc.store_id;
@@ -366,7 +376,7 @@ std::vector<int32_t> FalconKVClientImpl::BatchGetSync(
     // Build a map of key -> descriptor for cache hits
     std::unordered_map<std::string, KeyDescriptor> hit_map;
     for (const auto& desc : hit_descs) {
-        hit_map[desc.key] = desc;
+        hit_map.emplace(desc.key, desc);
     }
 
     // Step 2: For missing keys, query remote MetaManager
@@ -374,8 +384,7 @@ std::vector<int32_t> FalconKVClientImpl::BatchGetSync(
         auto records = meta_client_.BatchLookup(missing_keys);
         for (size_t i = 0; i < records.size(); ++i) {
             if (!records[i].key.empty()) {
-                KeyDescriptor desc;
-                desc.key = records[i].key;
+                KeyDescriptor desc(records[i].key);
                 desc.store_id = records[i].store_id;
                 desc.offset = records[i].offset;
                 desc.size = records[i].size;
@@ -396,7 +405,7 @@ std::vector<int32_t> FalconKVClientImpl::BatchGetSync(
                     store_addr_map_[records[i].store_id] = records[i].store_addr;
                     desc.store_addr = records[i].store_addr;
                 }
-                hit_map[records[i].key] = desc;
+                hit_map.emplace(records[i].key, desc);
                 key_desc_cache_.Insert(records[i].key, desc);
             }
         }

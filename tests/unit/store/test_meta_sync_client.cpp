@@ -25,7 +25,7 @@ TEST(MetaSyncClientTest, SyncCommitSkippedWhenNotConnected) {
     rec.key = "key1";
     rec.offset = 100;
     rec.size = 50;
-    rec.chunk_size = 2048;
+    rec.alloc_size = 2048;
     records.push_back(rec);
 
     Status s = client.SyncCommit(1, records);
@@ -49,6 +49,6 @@ TEST(MetaSyncClientTest, SyncRemoveSkippedWhenNotConnected) {
 TEST(MetaSyncClientTest, RegisterStoreSkippedWhenNotConnected) {
     MetaSyncClient client;
 
-    Status s = client.RegisterStore(1, 1, "/data/kv_data_1", 1024 * 1024, 2048);
+    Status s = client.RegisterStore(1, 1, "/data/kv_data_1", 1024 * 1024);
     EXPECT_TRUE(s.ok());
 }

@@ -12,14 +12,11 @@ namespace {
 
 KeyDescriptor MakeDesc(const std::string& key, uint32_t store_id = 1,
                        uint64_t offset = 0, uint32_t size = 4096) {
-    KeyDescriptor desc;
-    desc.key = key;
+    KeyDescriptor desc(key);
     desc.store_id = store_id;
     desc.offset = offset;
     desc.size = size;
-    desc.chunk_size = 4096;
     desc.access_type = AccessType::ACCESS_LOCAL_DIRECT;
-    desc.data_file = "/tmp/falconkv_test/data_" + std::to_string(store_id);
     return desc;
 }
 

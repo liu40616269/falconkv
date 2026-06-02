@@ -98,7 +98,7 @@ bool EvictManager::TryEvictBatch() {
     // 2. Remove from local index and enqueue for deferred space reclamation.
     for (const auto& rec : candidates) {
         meta_index_->Remove(rec.key);
-        pending_queue_->Enqueue(rec.key, rec.offset);
+        pending_queue_->Enqueue(rec.key, rec.offset, rec.alloc_size);
     }
 
     return true;

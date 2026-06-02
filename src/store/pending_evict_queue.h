@@ -13,7 +13,7 @@ namespace falconkv {
 class BuddyAllocator;
 
 /// PendingEvictQueue holds evicted key records for a grace period before
-/// reclaiming their SSD space via BuddyAllocator::FreeChunk().  The Meta
+/// reclaiming their SSD space via BuddyAllocator::Free().  The Meta
 /// server has already been notified of the eviction; the grace period
 /// prevents in-flight reads from other nodes from hitting freed space.
 class PendingEvictQueue {
@@ -21,6 +21,7 @@ public:
     struct EvictEntry {
         std::string key;
         uint64_t offset;       ///< SSD offset to free
+        uint32_t alloc_size;   ///< actual allocated size for Free()
         uint64_t enqueue_time_ms;  ///< wall-clock time when enqueued
     };
 
@@ -32,8 +33,8 @@ public:
     PendingEvictQueue(const PendingEvictQueue&) = delete;
     PendingEvictQueue& operator=(const PendingEvictQueue&) = delete;
 
-    /// Enqueue a key/offset for deferred space reclamation.
-    void Enqueue(const std::string& key, uint64_t offset);
+    /// Enqueue a key/offset/alloc_size for deferred space reclamation.
+    void Enqueue(const std::string& key, uint64_t offset, uint32_t alloc_size);
 
     /// Start the background evict loop thread.
     void Start();

@@ -754,103 +754,182 @@ Level 4 - UDS 文件存在性（瞬时）
 
 ### 6.2 Client 端 Bypass 实现
 
+SchedulerProxy 通过 brpc Channel/Stub 与 Scheduler 进程通信。当 brpc 不可用时（编译时未开启），自动降级为空操作（始终 bypass）。
+
 ```cpp
 class SchedulerProxy {
 public:
-    SchedulerProxy(const std::string& uds_path)
-        : uds_path_(uds_path), state_(State::DISCONNECTED) {}
+    explicit SchedulerProxy(const std::string& uds_path);
+    ~SchedulerProxy();
 
-    // 申请 IO（带 bypass）
-    IOResponse RequestIO(const IORequest& request) {
-        // 快速路径：已标记不可用，直接 bypass
-        if (state_.load(std::memory_order_relaxed) == State::BYPASS) {
-            return MakeBypassResponse(request);
-        }
-
-        // 尝试 RPC
-        auto response = TryRequestIO(request);
-        if (response.has_value()) {
-            consecutive_failures_.store(0);
-            return response.value();
-        }
-
-        // RPC 失败，检查是否需要切换到 bypass
-        int failures = consecutive_failures_.fetch_add(1) + 1;
-        if (failures >= MAX_CONSECUTIVE_FAILURES) {
-            state_.store(State::BYPASS, std::memory_order_relaxed);
-            LOG(WARNING) << "Scheduler unreachable after "
-                         << failures << " failures, switching to BYPASS mode";
-            // 启动后台重连探测
-            StartReconnectProbe();
-        }
-
-        return MakeBypassResponse(request);
-    }
-
-    // 上报 IO 完成信息（带 bypass）
-    void ReportIOCompletion(const IOCompletionReport& report) {
-        if (state_.load(std::memory_order_relaxed) == State::BYPASS) {
-            return;  // bypass 模式下不上报
-        }
-        // fire-and-forget 上报，失败不影响主流程
-        TryReportAsync(report);
-    }
-
-    bool IsBypassMode() const {
-        return state_.load(std::memory_order_relaxed) == State::BYPASS;
-    }
+    IOResponseData RequestIO(const IORequestData& request);
+    void ReportIOCompletion(const IOCompletionData& report);
+    void StoreReportIOAsync(uint32_t store_id, int io_channel,
+                            uint32_t source_client_id, uint64_t io_size,
+                            uint64_t request_ts_ns, uint64_t done_ts_ns,
+                            const std::string& source_node_addr);
+    bool IsBypassMode() const;
 
 private:
-    enum class State {
-        CONNECTED,      // 正常连接
-        DISCONNECTED,   // 尚未连接
-        BYPASS,         // 已 bypass
-    };
+    enum class State { CONNECTED, DISCONNECTED, BYPASS };
 
-    static constexpr int MAX_CONSECUTIVE_FAILURES = 3;
+    IOResponseData MakeBypassResponse(const IORequestData& request);
+    void StartReconnectProbe();
+    bool ProbeScheduler();
 
-    IOResponse MakeBypassResponse(const IORequest& request) {
-        IOResponse resp;
-        resp.set_status(0);
-        resp.set_permitted_ts_ns(request.request_ts_ns());
-        resp.set_ticket(0);  // bypass 模式下 ticket=0
-        return resp;
-    }
-
-    void StartReconnectProbe() {
-        // 后台线程定期尝试重连 Scheduler
-        std::thread([this]() {
-            while (state_.load() == State::BYPASS) {
-                std::this_thread::sleep_for(
-                    std::chrono::seconds(RECONNECT_INTERVAL_SEC));
-                if (ProbeScheduler()) {
-                    state_.store(State::CONNECTED);
-                    consecutive_failures_.store(0);
-                    LOG(INFO) << "Scheduler reconnected, resuming normal mode";
-                    break;
-                }
-            }
-        }).detach();
-    }
-
-    bool ProbeScheduler() {
-        // 尝试建立新连接并发送心跳
-        try {
-            HeartbeatRequest req;
-            req.set_timestamp_ns(GetCurrentTimeNs());
-            auto resp = SendHeartbeat(req);
-            return resp.has_value() && resp->status() == 0;
-        } catch (...) {
-            return false;
-        }
-    }
+#ifdef FALCONKV_HAS_BRPC
+    bool Connect();  // 建立 brpc Channel 到 Scheduler（UDS）
+#endif
 
     std::string uds_path_;
     std::atomic<State> state_;
     std::atomic<int> consecutive_failures_{0};
+    std::atomic<bool> stopped_{false};   // 析构时置 true，通知重连线程退出
+
+    static constexpr int MAX_CONSECUTIVE_FAILURES = 3;
     static constexpr int RECONNECT_INTERVAL_SEC = 2;
+    static constexpr int RPC_TIMEOUT_MS = 2;  // brpc RPC 超时
+
+    mutable std::mutex reconnect_mutex_;
+    bool reconnect_started_ = false;
+    std::thread reconnect_thread_;  // joinable，析构时 join
+
+#ifdef FALCONKV_HAS_BRPC
+    std::unique_ptr<brpc::Channel> channel_;
+    std::unique_ptr<FalconKVSchedulerService_Stub> stub_;
+#endif
 };
 ```
+
+#### brpc 通信实现
+
+当 `FALCONKV_HAS_BRPC` 编译宏开启时，SchedulerProxy 使用 brpc 通过 UDS 与 Scheduler 通信：
+
+```cpp
+// 建立 UDS 连接
+bool SchedulerProxy::Connect() {
+    if (!channel_) {
+        channel_ = std::make_unique<brpc::Channel>();
+    }
+    brpc::ChannelOptions options;
+    options.timeout_ms = RPC_TIMEOUT_MS;
+    options.protocol = brpc::PROTOCOL_BAIDU_STD;
+    std::string addr = "unix:" + uds_path_;
+    if (channel_->Init(addr.c_str(), &options) != 0) {
+        channel_.reset();
+        stub_.reset();
+        return false;
+    }
+    stub_ = std::make_unique<FalconKVSchedulerService_Stub>(channel_.get());
+    return true;
+}
+
+// 通过 Heartbeat RPC 检测 Scheduler 可达性
+bool SchedulerProxy::ProbeScheduler() {
+    if (!Connect()) return false;
+    HeartbeatRequest req;
+    req.set_timestamp_ns(NowNanos());
+    HeartbeatResponse resp;
+    brpc::Controller cntl;
+    stub_->Heartbeat(&cntl, &req, &resp, nullptr);
+    return !cntl.Failed();
+}
+```
+
+#### IO 申请与上报
+
+```cpp
+IOResponseData SchedulerProxy::RequestIO(const IORequestData& request) {
+    State s = state_.load(std::memory_order_acquire);
+
+    // 快速路径：已标记不可用，直接 bypass
+    if (s == State::BYPASS) {
+        return MakeBypassResponse(request);
+    }
+
+    // 尝试连接
+    if (s == State::DISCONNECTED) {
+        if (ProbeScheduler()) {
+            state_.store(State::CONNECTED, std::memory_order_release);
+        } else {
+            StartReconnectProbe();
+            return MakeBypassResponse(request);
+        }
+    }
+
+    // CONNECTED — 发送真实 RPC
+    IORequest io_req;
+    io_req.set_client_id(request.client_id);
+    io_req.set_io_channel(static_cast<IOChannel>(request.io_channel));
+    io_req.set_store_id(request.store_id);
+    io_req.set_io_size(request.io_size);
+    io_req.set_priority(request.priority);
+    io_req.set_request_ts_ns(request.request_ts_ns);
+    io_req.set_remote_node_addr(request.remote_node_addr);
+
+    IOResponse io_resp;
+    brpc::Controller cntl;
+    cntl.set_timeout_ms(RPC_TIMEOUT_MS);
+    stub_->RequestIO(&cntl, &io_req, &io_resp, nullptr);
+
+    if (cntl.Failed()) {
+        int failures = consecutive_failures_.fetch_add(1) + 1;
+        if (failures >= MAX_CONSECUTIVE_FAILURES) {
+            state_.store(State::BYPASS, std::memory_order_release);
+            StartReconnectProbe();
+        }
+        return MakeBypassResponse(request);
+    }
+
+    consecutive_failures_.store(0);
+    IOResponseData resp;
+    resp.status = io_resp.status();
+    resp.permitted_ts_ns = io_resp.permitted_ts_ns();
+    resp.ticket = io_resp.ticket();
+    return resp;
+}
+```
+
+#### 重连探测与生命周期管理
+
+重连线程使用 `stopped_` 原子标志和 joinable 线程（非 detached），确保析构时安全退出：
+
+```cpp
+void SchedulerProxy::StartReconnectProbe() {
+    std::lock_guard<std::mutex> lock(reconnect_mutex_);
+    if (reconnect_started_) return;
+    reconnect_started_ = true;
+
+    reconnect_thread_ = std::thread([this]() {
+        while (!stopped_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(
+                std::chrono::seconds(RECONNECT_INTERVAL_SEC));
+            if (stopped_.load(std::memory_order_acquire)) return;
+            if (ProbeScheduler()) {
+                state_.store(State::CONNECTED);
+                consecutive_failures_.store(0);
+                {
+                    std::lock_guard<std::mutex> lk(reconnect_mutex_);
+                    reconnect_started_ = false;
+                }
+                return;
+            }
+        }
+    });
+}
+
+SchedulerProxy::~SchedulerProxy() {
+    stopped_.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(reconnect_mutex_);
+    if (reconnect_thread_.joinable()) {
+        reconnect_thread_.join();
+    }
+}
+```
+
+#### 无 brpc 降级
+
+当编译时未开启 brpc（`FALCONKV_HAS_BRPC` 未定义），`ProbeScheduler()` 始终返回 `false`，`RequestIO()` 始终返回 bypass 响应，`ReportIOCompletion()` 和 `StoreReportIOAsync()` 为空操作。
 
 ### 6.3 Store 端 Bypass 实现
 
@@ -880,8 +959,8 @@ void FalconKVStore::OnRPCReadRequest(const ReadRequest& req) {
 
 | 场景 | 检测时间 | 恢复动作 |
 |------|----------|----------|
-| Scheduler 进程退出 | < 100us（RPC 连接失败） | 立即 bypass |
-| Scheduler hang（不响应） | < 100us（RPC 超时） | 本次 bypass，连续 3 次后永久 bypass |
+| Scheduler 进程退出 | < 2ms（brpc RPC 连接失败） | 立即 bypass，连续 3 次后永久 bypass |
+| Scheduler hang（不响应） | < 2ms（brpc RPC 超时 `RPC_TIMEOUT_MS`） | 本次 bypass，连续 3 次后永久 bypass |
 | Scheduler 启动延迟 | N/A（Client 启动时检测） | 直接 bypass 模式启动 |
 | Scheduler 恢复 | < 2s（后台探测间隔） | 自动恢复正常模式 |
 | UDS 文件不存在 | 瞬时（启动时检查） | bypass 模式启动 |
@@ -1107,18 +1186,28 @@ private:
 
 ## 9. 配置项
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `scheduler_uds_path` | /tmp/falconkv_scheduler.sock | UDS 监听路径 |
-| `scheduler_enabled` | true | 是否启用 Scheduler（false 时 Client 直接 bypass） |
+Scheduler 相关配置分布在 **common 区**（Client/Store 与 Scheduler 通信的参数）和 **scheduler 区**（Scheduler 服务端自身的参数）。
+
+### 9.1 common 区（共享，自动传播到 Client/Store/Scheduler）
+
+| JSON 字段 (`common.*`) | 默认值 | 说明 |
+|------------------------|--------|------|
+| `scheduler_enabled` | true | 是否启用 Scheduler 通信（false 时 Client/Store 直接 bypass） |
+| `scheduler_uds_path` | /tmp/falconkv_scheduler.sock | Scheduler UDS 路径 |
+| `scheduler_rpc_timeout_us` | 2000 | Client/Store 到 Scheduler 的 RPC 超时（微秒） |
+| `max_consecutive_failures` | 3 | SchedulerProxy 连续 RPC 失败次数阈值（触发 bypass） |
+| `reconnect_interval_sec` | 2 | bypass 后重连探测间隔（秒） |
+
+### 9.2 scheduler 区（Scheduler 服务端专属）
+
+| JSON 字段 (`scheduler.*`) | 默认值 | 说明 |
+|---------------------------|--------|------|
+| `enabled` | true | Scheduler 服务是否启用 |
 | `schedule_policy` | passthrough | 调度策略名 |
 | `ssd_bw_limit_mbps` | 7000 | SSD 带宽上限 MB/s（NVMe 约 7GB/s） |
 | `net_bw_limit_mbps` | 12500 | 网络带宽上限 MB/s（100Gbps 约 12.5GB/s） |
-| `stats_report_interval_sec` | 5 | 统计报告打印间隔 |
-| `stats_window_ms` | 1000 | 统计时间窗口大小 |
-| `scheduler_rpc_timeout_us` | 100 | Client/Store 到 Scheduler 的 RPC 超时 |
-| `max_consecutive_failures` | 3 | 连续失败次数阈值（触发 bypass） |
-| `reconnect_interval_sec` | 2 | bypass 后重连探测间隔 |
+| `stats_report_interval_sec` | 5 | 统计报告打印间隔（秒） |
+| `stats_window_ms` | 1000 | 统计时间窗口大小（毫秒） |
 
 ## 10. 与其他模块的交互
 

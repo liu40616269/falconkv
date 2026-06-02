@@ -2,6 +2,7 @@ add_library(falconkv_common STATIC
     config.cpp
     status.cpp
     buddy_allocator.cpp
+    logging.cpp
 )
 
 target_include_directories(falconkv_common PUBLIC

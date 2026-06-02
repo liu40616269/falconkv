@@ -13,7 +13,7 @@ struct StoreKeyRecord {
     std::string key;
     uint64_t offset = 0;
     uint32_t size = 0;
-    uint32_t chunk_size = 0;
+    uint32_t alloc_size = 0;
     int stat = 0;             // 0=allocated, 1=committed, 2=evict
     uint64_t access_time_ms = 0;
 };

@@ -22,23 +22,18 @@ TEST(DataStructures, KeyDescriptorDefaultAccessType) {
 }
 
 TEST(DataStructures, KeyDescriptorFields) {
-    KeyDescriptor desc;
-    desc.key = "my_key";
+    KeyDescriptor desc("my_key");
     desc.store_id = 42;
     desc.offset = 1024;
     desc.size = 4096;
-    desc.chunk_size = 8192;
     desc.access_time_ms = 12345678;
-    desc.data_file = "/data/kv_data_42";
     desc.access_type = AccessType::ACCESS_LOCAL_DIRECT;
 
     EXPECT_EQ(desc.key, "my_key");
     EXPECT_EQ(desc.store_id, 42u);
     EXPECT_EQ(desc.offset, 1024u);
     EXPECT_EQ(desc.size, 4096u);
-    EXPECT_EQ(desc.chunk_size, 8192u);
     EXPECT_EQ(desc.access_time_ms, 12345678u);
-    EXPECT_EQ(desc.data_file, "/data/kv_data_42");
     EXPECT_EQ(desc.access_type, AccessType::ACCESS_LOCAL_DIRECT);
 }
 

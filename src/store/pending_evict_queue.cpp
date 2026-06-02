@@ -14,9 +14,9 @@ PendingEvictQueue::~PendingEvictQueue() {
     Stop();
 }
 
-void PendingEvictQueue::Enqueue(const std::string& key, uint64_t offset) {
+void PendingEvictQueue::Enqueue(const std::string& key, uint64_t offset, uint32_t alloc_size) {
     std::lock_guard<std::mutex> lock(mutex_);
-    entries_.push_back({key, offset, GetWallTimeMs()});
+    entries_.push_back({key, offset, alloc_size, GetWallTimeMs()});
 }
 
 void PendingEvictQueue::Start() {
@@ -63,7 +63,7 @@ void PendingEvictQueue::EvictLoop() {
 
         // Free space outside the lock.
         for (const auto& e : to_free) {
-            allocator_->FreeChunk(static_cast<int64_t>(e.offset));
+            allocator_->Free(static_cast<int64_t>(e.offset), e.alloc_size);
         }
     }
 }
@@ -76,7 +76,7 @@ void PendingEvictQueue::FlushAll() {
         entries_.clear();
     }
     for (const auto& e : remaining) {
-        allocator_->FreeChunk(static_cast<int64_t>(e.offset));
+        allocator_->Free(static_cast<int64_t>(e.offset), e.alloc_size);
     }
 }
 

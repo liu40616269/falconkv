@@ -11,11 +11,12 @@ using namespace falconkv;
 // PendingEvictQueue: Enqueue + grace period expiry + space reclamation
 // ---------------------------------------------------------------------------
 TEST(PendingEvictQueueTest, EnqueueAndGracePeriod) {
-    BuddyAllocator alloc(4096 * 64, 4096, 1);
+    BuddyAllocator alloc(4096 * 64, 4096);
 
     // Allocate two chunks
-    int64_t off1 = alloc.AllocChunk();
-    int64_t off2 = alloc.AllocChunk();
+    uint32_t as1 = 0, as2 = 0;
+    int64_t off1 = alloc.Alloc(4096, &as1);
+    int64_t off2 = alloc.Alloc(4096, &as2);
     ASSERT_GE(off1, 0);
     ASSERT_GE(off2, 0);
 
@@ -26,8 +27,8 @@ TEST(PendingEvictQueueTest, EnqueueAndGracePeriod) {
     PendingEvictQueue queue(100, &alloc);
     queue.Start();
 
-    queue.Enqueue("key1", static_cast<uint64_t>(off1));
-    queue.Enqueue("key2", static_cast<uint64_t>(off2));
+    queue.Enqueue("key1", static_cast<uint64_t>(off1), as1);
+    queue.Enqueue("key2", static_cast<uint64_t>(off2), as2);
 
     EXPECT_EQ(queue.Size(), 2u);
 
@@ -48,10 +49,11 @@ TEST(PendingEvictQueueTest, EnqueueAndGracePeriod) {
 // PendingEvictQueue: Stop flushes immediately (ignores grace period)
 // ---------------------------------------------------------------------------
 TEST(PendingEvictQueueTest, StopFlushesImmediately) {
-    BuddyAllocator alloc(4096 * 64, 4096, 1);
+    BuddyAllocator alloc(4096 * 64, 4096);
 
-    int64_t off1 = alloc.AllocChunk();
-    int64_t off2 = alloc.AllocChunk();
+    uint32_t as1 = 0, as2 = 0;
+    int64_t off1 = alloc.Alloc(4096, &as1);
+    int64_t off2 = alloc.Alloc(4096, &as2);
     ASSERT_GE(off1, 0);
     ASSERT_GE(off2, 0);
 
@@ -61,8 +63,8 @@ TEST(PendingEvictQueueTest, StopFlushesImmediately) {
     PendingEvictQueue queue(60000, &alloc);
     queue.Start();
 
-    queue.Enqueue("key1", static_cast<uint64_t>(off1));
-    queue.Enqueue("key2", static_cast<uint64_t>(off2));
+    queue.Enqueue("key1", static_cast<uint64_t>(off1), as1);
+    queue.Enqueue("key2", static_cast<uint64_t>(off2), as2);
 
     // Stop immediately without waiting for grace period
     queue.Stop();
@@ -78,9 +80,10 @@ TEST(PendingEvictQueueTest, StopFlushesImmediately) {
 // PendingEvictQueue: Entries within grace period are not freed
 // ---------------------------------------------------------------------------
 TEST(PendingEvictQueueTest, WithinGracePeriodNotFreed) {
-    BuddyAllocator alloc(4096 * 64, 4096, 1);
+    BuddyAllocator alloc(4096 * 64, 4096);
 
-    int64_t off1 = alloc.AllocChunk();
+    uint32_t as1 = 0;
+    int64_t off1 = alloc.Alloc(4096, &as1);
     ASSERT_GE(off1, 0);
 
     uint64_t used_after_alloc = alloc.GetUsedBytes();
@@ -89,7 +92,7 @@ TEST(PendingEvictQueueTest, WithinGracePeriodNotFreed) {
     PendingEvictQueue queue(5000, &alloc);
     queue.Start();
 
-    queue.Enqueue("key1", static_cast<uint64_t>(off1));
+    queue.Enqueue("key1", static_cast<uint64_t>(off1), as1);
 
     // Wait only 200ms — well within 5s grace period
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -111,7 +114,7 @@ TEST(PendingEvictQueueTest, WithinGracePeriodNotFreed) {
 // PendingEvictQueue: Empty queue Stop is safe
 // ---------------------------------------------------------------------------
 TEST(PendingEvictQueueTest, EmptyQueueStopIsSafe) {
-    BuddyAllocator alloc(4096 * 64, 4096, 1);
+    BuddyAllocator alloc(4096 * 64, 4096);
     PendingEvictQueue queue(100, &alloc);
 
     // Start and stop without enqueuing anything

@@ -1,0 +1,60 @@
+{
+  "test": {
+    "duration_sec": 30,
+    "batch_size": 8,
+    "value_size": 4096,
+    "shared_key_ratio": 0.3,
+    "warmup_sec": 3,
+    "meta_listen_port": 18900,
+    "scheduler_uds_path": "/tmp/falconkv_perf_sched.sock",
+    "result_dir": "/tmp/falconkv_perf_result"
+  },
+  "meta": {
+    "shard_count": 16
+  },
+  "scheduler": {
+    "schedule_policy": "passthrough",
+    "enabled": true
+  },
+  "clients": [
+    {
+      "client_id": "A",
+      "node_id": 1,
+      "store_id": 1,
+      "listen_port": 18901,
+      "ssd_path": "/tmp/falconkv_perf_ssd/A",
+      "capacity_gb": 1,
+      "cache_capacity": 100000,
+      "io_threads": 2,
+      "buffer_pool_size": 4,
+      "store_rpc_host": "127.0.0.1"
+    },
+    {
+      "client_id": "B",
+      "node_id": 1,
+      "store_id": 2,
+      "listen_port": 18912,
+      "ssd_path": "/tmp/falconkv_perf_ssd/B",
+      "capacity_gb": 1,
+      "cache_capacity": 100000,
+      "io_threads": 2,
+      "buffer_pool_size": 4,
+      "store_rpc_host": "127.0.0.1"
+    },
+    {
+      "client_id": "C",
+      "node_id": 2,
+      "store_id": 3,
+      "listen_port": 18923,
+      "ssd_path": "/tmp/falconkv_perf_ssd/C",
+      "capacity_gb": 1,
+      "cache_capacity": 100000,
+      "io_threads": 2,
+      "buffer_pool_size": 4,
+      "store_rpc_host": "127.0.0.1"
+    }
+  ],
+  "transfer": {
+    "meta_addr": "127.0.0.1:18900"
+  }
+}

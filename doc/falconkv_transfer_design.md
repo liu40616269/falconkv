@@ -455,17 +455,17 @@ public:
 
 ### 5.2 配置
 
-```yaml
-# transfer 配置
-transfer:
-  protocol: brpc              # 通信协议
-  meta_addr: "meta-node:8900" # Meta 地址
-  meta_pool_size: 4           # Meta 连接池大小
-  store_pool_size: 4          # Store 连接池大小
-  rpc_timeout_ms: 5000        # RPC 超时
-  connect_timeout_ms: 3000    # 连接超时
-  max_retry: 3                # 重试次数
-```
+`meta_addr` 由 **common 区**自动传播（`common.meta_addr → transfer.meta_addr`），其余字段为 transfer 区专属。
+
+| JSON 字段 (`transfer.*`) | 默认值 | 说明 |
+|--------------------------|--------|------|
+| `protocol` | brpc | 通信协议 |
+| `meta_addr` | localhost:18900 | Meta 地址（由 `common.meta_addr` 传播） |
+| `meta_pool_size` | 4 | Meta 连接池大小 |
+| `store_pool_size` | 4 | Store 连接池大小 |
+| `rpc_timeout_ms` | 5000 | RPC 超时（毫秒） |
+| `connect_timeout_ms` | 3000 | 连接超时（毫秒） |
+| `max_retry` | 3 | 重试次数 |
 
 ## 6. 线程模型
 

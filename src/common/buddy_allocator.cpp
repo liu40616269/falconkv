@@ -21,17 +21,18 @@ static uint32_t CeilLog2(uint32_t v) {
     return r;
 }
 
+static uint32_t AlignUp(uint32_t value, uint32_t alignment) {
+    return (value + alignment - 1) / alignment * alignment;
+}
+
 // ---------- ctor / public ----------
 
-BuddyAllocator::BuddyAllocator(uint64_t total_bytes, uint32_t page_size,
-                               uint32_t chunk_pages)
+BuddyAllocator::BuddyAllocator(uint64_t total_bytes, uint32_t page_size)
     : page_size_(page_size),
-      chunk_pages_(chunk_pages),
       total_pages_(0),
       used_pages_(0),
       max_order_(0) {
     assert(page_size > 0);
-    assert(chunk_pages > 0);
 
     total_pages_ = static_cast<uint32_t>(total_bytes / page_size);
     if (total_pages_ == 0) total_pages_ = 1;
@@ -49,27 +50,38 @@ BuddyAllocator::BuddyAllocator(uint64_t total_bytes, uint32_t page_size,
     free_list_[max_order_].push_back(0);
 }
 
-int64_t BuddyAllocator::AllocChunk() {
+uint32_t BuddyAllocator::ComputeAllocSize(uint32_t size) const {
+    if (size == 0) return page_size_;
+    uint32_t aligned = AlignUp(size, page_size_);
+    uint32_t pages_needed = aligned / page_size_;
+    if (pages_needed == 0) pages_needed = 1;
+    uint32_t target_order = CeilLog2(pages_needed);
+    return (1u << target_order) * page_size_;
+}
+
+int64_t BuddyAllocator::Alloc(uint32_t size, uint32_t* out_alloc_size) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // The number of pages this chunk needs.
-    uint32_t needed = chunk_pages_;
-    uint32_t target_order = CeilLog2(needed);
+    // Compute pages needed from actual data size.
+    uint32_t aligned = AlignUp(size, page_size_);
+    uint32_t pages_needed = aligned / page_size_;
+    if (pages_needed == 0) pages_needed = 1;
+    uint32_t target_order = CeilLog2(pages_needed);
 
     // Ensure target_order does not exceed max_order_.
     if (target_order > max_order_) {
-        LOG(ERROR) << "[BuddyAllocator] AllocChunk: chunk too large, chunk_pages="
-                   << chunk_pages_ << ", max_order=" << max_order_;
-        return -1; // chunk too large for the allocator
+        LOG(ERROR) << "[BuddyAllocator] Alloc: size too large, pages_needed="
+                   << pages_needed << ", max_order=" << max_order_;
+        return -1;
     }
 
     // Find a free block of suitable order.
     uint32_t found_order = FindFreeOrder(target_order);
     if (found_order > max_order_) {
-        LOG(WARNING) << "[BuddyAllocator] AllocChunk: out of space, used_pages="
+        LOG(WARNING) << "[BuddyAllocator] Alloc: out of space, used_pages="
                      << used_pages_ << "/" << total_pages_
                      << " (" << (total_pages_ > 0 ? (used_pages_ * 100 / total_pages_) : 0) << "%)";
-        return -1; // out of space
+        return -1;
     }
 
     // Split down to target_order if necessary.
@@ -89,11 +101,16 @@ int64_t BuddyAllocator::AllocChunk() {
     }
     used_pages_ += block_pages;
 
-    // Return byte offset.
+    // Return actual allocated size.
+    uint32_t alloc_size = block_pages * page_size_;
+    if (out_alloc_size) {
+        *out_alloc_size = alloc_size;
+    }
+
     return static_cast<int64_t>(page_start) * page_size_;
 }
 
-void BuddyAllocator::FreeChunk(int64_t offset) {
+void BuddyAllocator::Free(int64_t offset, uint32_t alloc_size) {
     if (offset < 0) return;
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -101,10 +118,10 @@ void BuddyAllocator::FreeChunk(int64_t offset) {
     uint32_t page_start = static_cast<uint32_t>(offset / page_size_);
     if (page_start >= total_pages_) return;
 
-    // Determine the order of this chunk.  A chunk occupies chunk_pages_ aligned
-    // pages, but we need to figure out which order it was allocated at.
-    // We use the same logic as AllocChunk: order = ceil(log2(chunk_pages_)).
-    uint32_t target_order = CeilLog2(chunk_pages_);
+    // Determine the order from the actual allocation size.
+    uint32_t pages = alloc_size / page_size_;
+    if (pages == 0) pages = 1;
+    uint32_t target_order = CeilLog2(pages);
     if (target_order > max_order_) target_order = max_order_;
 
     uint32_t block_pages = 1u << target_order;

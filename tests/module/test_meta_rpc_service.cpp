@@ -17,7 +17,6 @@ TEST(MetaRpcServiceTest, StoreRegister) {
     info.node_id = 10;
     info.store_addr = "10.0.0.1:8901";
     info.data_file = "/data/kv_data_1";
-    info.chunk_size = 2097152;
 
     Status s = mgr.RegisterStore(info);
     ASSERT_TRUE(s.ok()) << "RegisterStore failed: " << s.msg();
@@ -51,7 +50,6 @@ TEST(MetaRpcServiceTest, BatchExistBatchQuery) {
     info.store_id = 1;
     info.node_id = 1;
     info.store_addr = "localhost:8901";
-    info.chunk_size = 4096;
     mgr.RegisterStore(info);
 
     // Commit 5 records.

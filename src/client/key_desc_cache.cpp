@@ -10,19 +10,18 @@ KeyDescCache::KeyDescCache(size_t capacity)
 
 std::optional<KeyDescriptor> KeyDescCache::Lookup(const std::string& key) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cache_.find(key);
+    auto it = cache_.find(std::string_view(key));
     if (it == cache_.end()) {
         return std::nullopt;
     }
-    // Move key to the back of the LRU list (most recently used)
-    lru_list_.remove(key);
-    lru_list_.push_back(key);
+    // Move to back of LRU list (most recently used) via O(1) splice
+    lru_list_.splice(lru_list_.end(), lru_list_, it->second);
     // Update access time
     auto now = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()).count();
-    it->second.access_time_ms = static_cast<uint64_t>(ms);
-    return it->second;
+    it->second->access_time_ms = static_cast<uint64_t>(ms);
+    return *(it->second);
 }
 
 int KeyDescCache::BatchLookup(const std::vector<std::string>& keys,
@@ -37,14 +36,13 @@ int KeyDescCache::BatchLookup(const std::vector<std::string>& keys,
     missing_keys.clear();
 
     for (const auto& key : keys) {
-        auto it = cache_.find(key);
+        auto it = cache_.find(std::string_view(key));
         if (it != cache_.end()) {
-            // Move key to the back of the LRU list
-            lru_list_.remove(key);
-            lru_list_.push_back(key);
+            // Move to back of LRU list via O(1) splice
+            lru_list_.splice(lru_list_.end(), lru_list_, it->second);
             // Update access time
-            it->second.access_time_ms = static_cast<uint64_t>(ms);
-            hit_descs.push_back(it->second);
+            it->second->access_time_ms = static_cast<uint64_t>(ms);
+            hit_descs.push_back(*(it->second));
         } else {
             missing_keys.push_back(key);
         }
@@ -55,16 +53,29 @@ int KeyDescCache::BatchLookup(const std::vector<std::string>& keys,
 
 void KeyDescCache::Insert(const std::string& key, const KeyDescriptor& desc) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cache_.find(key);
+    auto it = cache_.find(std::string_view(key));
     if (it != cache_.end()) {
-        // Key already exists, update value and move to back of LRU
-        it->second = desc;
-        lru_list_.remove(key);
-        lru_list_.push_back(key);
+        // Key already exists: update fields (skip const key) + splice to back
+        auto& existing = *(it->second);
+        existing.store_id = desc.store_id;
+        existing.offset = desc.offset;
+        existing.size = desc.size;
+        existing.access_time_ms = desc.access_time_ms;
+        existing.store_addr = desc.store_addr;
+        existing.access_type = desc.access_type;
+        lru_list_.splice(lru_list_.end(), lru_list_, it->second);
     } else {
         EvictIfNeeded();
-        cache_[key] = desc;
-        lru_list_.push_back(key);
+        // Construct with key, then copy remaining fields
+        lru_list_.emplace_back(KeyDescriptor(key));
+        auto list_it = std::prev(lru_list_.end());
+        list_it->store_id = desc.store_id;
+        list_it->offset = desc.offset;
+        list_it->size = desc.size;
+        list_it->access_time_ms = desc.access_time_ms;
+        list_it->store_addr = desc.store_addr;
+        list_it->access_type = desc.access_type;
+        cache_.emplace(std::string_view(list_it->key), list_it);
     }
 }
 
@@ -72,24 +83,37 @@ void KeyDescCache::BatchInsert(
     const std::vector<std::pair<std::string, KeyDescriptor>>& items) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& [key, desc] : items) {
-        auto it = cache_.find(key);
+        auto it = cache_.find(std::string_view(key));
         if (it != cache_.end()) {
-            it->second = desc;
-            lru_list_.remove(key);
-            lru_list_.push_back(key);
+            // Update fields (skip const key) + splice to back
+            auto& existing = *(it->second);
+            existing.store_id = desc.store_id;
+            existing.offset = desc.offset;
+            existing.size = desc.size;
+            existing.access_time_ms = desc.access_time_ms;
+            existing.store_addr = desc.store_addr;
+            existing.access_type = desc.access_type;
+            lru_list_.splice(lru_list_.end(), lru_list_, it->second);
         } else {
             EvictIfNeeded();
-            cache_[key] = desc;
-            lru_list_.push_back(key);
+            lru_list_.emplace_back(KeyDescriptor(key));
+            auto list_it = std::prev(lru_list_.end());
+            list_it->store_id = desc.store_id;
+            list_it->offset = desc.offset;
+            list_it->size = desc.size;
+            list_it->access_time_ms = desc.access_time_ms;
+            list_it->store_addr = desc.store_addr;
+            list_it->access_type = desc.access_type;
+            cache_.emplace(std::string_view(list_it->key), list_it);
         }
     }
 }
 
 void KeyDescCache::Invalidate(const std::string& key) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cache_.find(key);
+    auto it = cache_.find(std::string_view(key));
     if (it != cache_.end()) {
-        lru_list_.remove(key);
+        lru_list_.erase(it->second);
         cache_.erase(it);
     }
 }
@@ -97,9 +121,9 @@ void KeyDescCache::Invalidate(const std::string& key) {
 void KeyDescCache::BatchInvalidate(const std::vector<std::string>& keys) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& key : keys) {
-        auto it = cache_.find(key);
+        auto it = cache_.find(std::string_view(key));
         if (it != cache_.end()) {
-            lru_list_.remove(key);
+            lru_list_.erase(it->second);
             cache_.erase(it);
         }
     }
@@ -119,8 +143,7 @@ void KeyDescCache::Clear() {
 void KeyDescCache::EvictIfNeeded() {
     // Caller must hold mutex_
     while (cache_.size() >= capacity_ && !lru_list_.empty()) {
-        const std::string& oldest_key = lru_list_.front();
-        cache_.erase(oldest_key);
+        cache_.erase(std::string_view(lru_list_.front().key));
         lru_list_.pop_front();
     }
 }

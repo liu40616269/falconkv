@@ -5,6 +5,10 @@
 
 #include "src/common/logging.h"
 
+#ifdef FALCONKV_HAS_BRPC
+#include <brpc/controller.h>
+#endif
+
 namespace falconkv {
 
 namespace {
@@ -30,9 +34,15 @@ uint64_t NextBypassTicket() {
 // SchedulerProxy
 // ---------------------------------------------------------------------------
 
-SchedulerProxy::SchedulerProxy(const std::string& uds_path)
+SchedulerProxy::SchedulerProxy(const std::string& uds_path,
+                               int rpc_timeout_ms,
+                               int max_consecutive_failures,
+                               int reconnect_interval_sec)
     : uds_path_(uds_path),
-      state_(State::DISCONNECTED) {
+      state_(State::DISCONNECTED),
+      max_consecutive_failures_(max_consecutive_failures),
+      reconnect_interval_sec_(reconnect_interval_sec),
+      rpc_timeout_ms_(rpc_timeout_ms) {
     // Attempt an initial probe.
     if (ProbeScheduler()) {
         state_.store(State::CONNECTED, std::memory_order_release);
@@ -44,9 +54,46 @@ SchedulerProxy::SchedulerProxy(const std::string& uds_path)
 }
 
 SchedulerProxy::~SchedulerProxy() {
-    // The reconnect thread (if any) is a detached thread, so there is nothing
-    // to join.  If we wanted cleaner shutdown we could add a stop flag, but
-    // the proxy is typically alive for the process lifetime.
+    stopped_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(reconnect_mutex_);
+        if (reconnect_thread_.joinable()) {
+            reconnect_thread_.join();
+        }
+    }
+}
+
+#ifdef FALCONKV_HAS_BRPC
+
+bool SchedulerProxy::Connect() {
+    if (!channel_) {
+        channel_ = std::make_unique<brpc::Channel>();
+    }
+    brpc::ChannelOptions options;
+    options.timeout_ms = rpc_timeout_ms_;
+    options.protocol = brpc::PROTOCOL_BAIDU_STD;
+    std::string addr = "unix:" + uds_path_;
+    if (channel_->Init(addr.c_str(), &options) != 0) {
+        channel_.reset();
+        stub_.reset();
+        return false;
+    }
+    stub_ = std::make_unique<FalconKVSchedulerService_Stub>(channel_.get());
+    return true;
+}
+
+bool SchedulerProxy::ProbeScheduler() {
+    if (!Connect()) return false;
+
+    HeartbeatRequest req;
+    req.set_timestamp_ns(NowNanos());
+    HeartbeatResponse resp;
+    brpc::Controller cntl;
+    stub_->Heartbeat(&cntl, &req, &resp, nullptr);
+    if (cntl.Failed()) {
+        return false;
+    }
+    return true;
 }
 
 IOResponseData SchedulerProxy::RequestIO(const IORequestData& request) {
@@ -66,56 +113,158 @@ IOResponseData SchedulerProxy::RequestIO(const IORequestData& request) {
         }
     }
 
-    // state == CONNECTED -- try the RPC.
-    // For now the RPC path is a placeholder.  When brpc is available this
-    // would open a channel to uds_path_ and call RequestIO().
-    // We simulate a successful RPC here.
-
-    // Mock RPC: if the UDS file "conceptually" exists, succeed.
-    // In reality we would issue a brpc call and check for errors.
-    // For the mock implementation we just pretend the call succeeded.
-    bool rpc_ok = true;  // placeholder -- always succeeds in mock mode.
-
-    if (rpc_ok) {
-        consecutive_failures_.store(0, std::memory_order_relaxed);
-        IOResponseData resp;
-        resp.status = 0;
-        resp.permitted_ts_ns = NowNanos();
-        resp.ticket = NextBypassTicket();  // mock: local ticket
-        return resp;
-    }
-
-    // RPC failed.
-    int failures = consecutive_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (failures >= MAX_CONSECUTIVE_FAILURES) {
-        state_.store(State::BYPASS, std::memory_order_release);
+    // state == CONNECTED — send real RPC.
+    if (!stub_) {
+        // Stub unexpectedly null, fall back to bypass.
         StartReconnectProbe();
+        return MakeBypassResponse(request);
     }
-    return MakeBypassResponse(request);
+
+    IORequest io_req;
+    io_req.set_client_id(request.client_id);
+    io_req.set_io_channel(static_cast<IOChannel>(request.io_channel));
+    io_req.set_store_id(request.store_id);
+    io_req.set_io_size(request.io_size);
+    io_req.set_priority(request.priority);
+    io_req.set_request_ts_ns(request.request_ts_ns);
+    io_req.set_remote_node_addr(request.remote_node_addr);
+
+    IOResponse io_resp;
+    brpc::Controller cntl;
+    cntl.set_timeout_ms(rpc_timeout_ms_);
+    stub_->RequestIO(&cntl, &io_req, &io_resp, nullptr);
+
+    if (cntl.Failed()) {
+        int failures = consecutive_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (failures >= max_consecutive_failures_) {
+            state_.store(State::BYPASS, std::memory_order_release);
+            StartReconnectProbe();
+        }
+        return MakeBypassResponse(request);
+    }
+
+    // RPC succeeded.
+    consecutive_failures_.store(0, std::memory_order_relaxed);
+    IOResponseData resp;
+    resp.status = io_resp.status();
+    resp.permitted_ts_ns = io_resp.permitted_ts_ns();
+    resp.ticket = io_resp.ticket();
+    return resp;
 }
 
 void SchedulerProxy::ReportIOCompletion(const IOCompletionData& report) {
     State s = state_.load(std::memory_order_acquire);
     if (s == State::BYPASS) {
-        // Silently drop -- scheduler is unreachable.
         return;
     }
 
-    // Mock: pretend we sent the report.
-    // In a real implementation this would be an RPC call.
+    if (!stub_) {
+        return;
+    }
+
+    IOCompletionReport proto_report;
+    proto_report.set_client_id(report.client_id);
+    proto_report.set_ticket(report.ticket);
+    proto_report.set_io_start_ts_ns(report.io_start_ts_ns);
+    proto_report.set_io_done_ts_ns(report.io_done_ts_ns);
+    proto_report.set_io_size(report.io_size);
+    proto_report.set_io_channel(static_cast<IOChannel>(report.io_channel));
+    proto_report.set_io_status(report.io_status);
+    proto_report.set_store_id(report.store_id);
+    proto_report.set_remote_node_addr(report.remote_node_addr);
+
+    IOCompletionAck ack;
+    brpc::Controller cntl;
+    cntl.set_timeout_ms(rpc_timeout_ms_);
+    stub_->ReportIOCompletion(&cntl, &proto_report, &ack, nullptr);
+
+    if (cntl.Failed()) {
+        int failures = consecutive_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (failures >= max_consecutive_failures_) {
+            state_.store(State::BYPASS, std::memory_order_release);
+            StartReconnectProbe();
+        }
+    } else {
+        consecutive_failures_.store(0, std::memory_order_relaxed);
+    }
+}
+
+void SchedulerProxy::StoreReportIOAsync(uint32_t store_id,
+                                         int io_channel,
+                                         uint32_t source_client_id,
+                                         uint64_t io_size,
+                                         uint64_t request_ts_ns,
+                                         uint64_t done_ts_ns,
+                                         const std::string& source_node_addr) {
+    State s = state_.load(std::memory_order_acquire);
+    if (s == State::BYPASS) {
+        return;
+    }
+
+    if (!stub_) {
+        return;
+    }
+
+    StoreIOReport report;
+    report.set_store_id(store_id);
+    report.set_io_channel(static_cast<IOChannel>(io_channel));
+    report.set_source_client_id(source_client_id);
+    report.set_io_size(io_size);
+    report.set_request_ts_ns(request_ts_ns);
+    report.set_done_ts_ns(done_ts_ns);
+    report.set_source_node_addr(source_node_addr);
+
+    // Fire-and-forget: spawn a detached thread for the RPC call.
+    auto stub_ptr = stub_.get();
+    int timeout = rpc_timeout_ms_;
+    std::thread([stub_ptr, report = std::move(report), timeout]() {
+        StoreIOAck ack;
+        brpc::Controller cntl;
+        cntl.set_timeout_ms(timeout);
+        stub_ptr->StoreReportIO(&cntl, &report, &ack, nullptr);
+        if (cntl.Failed()) {
+            LOG(WARNING) << "SchedulerProxy: StoreReportIOAsync RPC failed: "
+                         << cntl.ErrorText();
+        }
+    }).detach();
+}
+
+#else  // !FALCONKV_HAS_BRPC
+
+// ---------------------------------------------------------------------------
+// Fallback: mock implementation when brpc is not available.
+// ---------------------------------------------------------------------------
+
+bool SchedulerProxy::ProbeScheduler() {
+    return false;
+}
+
+IOResponseData SchedulerProxy::RequestIO(const IORequestData& request) {
+    State s = state_.load(std::memory_order_acquire);
+
+    if (s == State::BYPASS) {
+        return MakeBypassResponse(request);
+    }
+
+    // In mock mode without brpc, always return bypass.
+    StartReconnectProbe();
+    return MakeBypassResponse(request);
+}
+
+void SchedulerProxy::ReportIOCompletion(const IOCompletionData& report) {
     (void)report;
 }
 
 void SchedulerProxy::StoreReportIOAsync(uint32_t /*store_id*/,
-                                        int /*io_channel*/,
-                                        uint32_t /*source_client_id*/,
-                                        uint64_t /*io_size*/,
-                                        uint64_t /*request_ts_ns*/,
-                                        uint64_t /*done_ts_ns*/,
-                                        const std::string& /*source_node_addr*/) {
-    // Fire-and-forget.  In the real implementation this would be an async RPC.
-    // For the mock we simply do nothing.
+                                         int /*io_channel*/,
+                                         uint32_t /*source_client_id*/,
+                                         uint64_t /*io_size*/,
+                                         uint64_t /*request_ts_ns*/,
+                                         uint64_t /*done_ts_ns*/,
+                                         const std::string& /*source_node_addr*/) {
 }
+
+#endif  // FALCONKV_HAS_BRPC
 
 bool SchedulerProxy::IsBypassMode() const {
     return state_.load(std::memory_order_acquire) == State::BYPASS;
@@ -133,25 +282,19 @@ IOResponseData SchedulerProxy::MakeBypassResponse(const IORequestData& /*request
     return resp;
 }
 
-bool SchedulerProxy::ProbeScheduler() {
-    // In a real implementation we would try to connect to the UDS endpoint
-    // (e.g. by creating a brpc Channel pointing at the Unix-domain socket).
-    // For the mock we simply return false to indicate the scheduler is not
-    // reachable.  Override to true if you want to test the connected path.
-    return false;
-}
-
 void SchedulerProxy::StartReconnectProbe() {
     std::lock_guard<std::mutex> lock(reconnect_mutex_);
     if (reconnect_started_) return;
     reconnect_started_ = true;
 
-    // Spawn a detached background thread that periodically probes the
+    // Spawn a joinable background thread that periodically probes the
     // scheduler and transitions back to CONNECTED when it becomes available.
-    std::thread([this]() {
-        while (true) {
+    reconnect_thread_ = std::thread([this]() {
+        while (!stopped_.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(
-                std::chrono::seconds(RECONNECT_INTERVAL_SEC));
+                std::chrono::seconds(reconnect_interval_sec_));
+
+            if (stopped_.load(std::memory_order_acquire)) return;
 
             if (ProbeScheduler()) {
                 state_.store(State::CONNECTED, std::memory_order_release);
@@ -165,7 +308,7 @@ void SchedulerProxy::StartReconnectProbe() {
                 return;
             }
         }
-    }).detach();
+    });
 }
 
 }  // namespace falconkv

@@ -1628,21 +1628,48 @@ class FalconKVConnectorAdapter(ConnectorAdapter):
 
 ## 6. 配置项
 
+Client 配置分为三部分：**Python 层 extra_config**（LMCache 传入）、**common 区共享配置**（自动传播）、**client 区专属配置**。
+
+### 6.1 Python 层 LMCache extra_config
+
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `falconkv_config_file` | str | 必填 | FalconKV 配置文件路径 |
+| `falconkv_config_file` | str | 必填 | FalconKV JSON 配置文件路径 |
 | `falconkv_cache_capacity` | int | 100000 | Key 描述缓存容量 |
 | `falconkv_async_batch_size` | int | 16 | 异步操作并发度 |
 | `falconkv_fire_and_forget` | bool | True | 是否启用 Fire-and-Forget Put |
-| `falconkv_scheduler_enabled` | bool | True | 是否启用 IO Scheduler |
-| `falconkv_scheduler_uds_path` | str | /tmp/falconkv_scheduler.sock | Scheduler UDS 路径 |
-| `falconkv_scheduler_rpc_timeout_us` | int | 100 | Scheduler RPC 超时 |
+
+### 6.2 JSON common 区（共享，自动传播）
+
+以下字段位于 `common` section，由 `ConfigLoader` 自动传播到 `client` 配置，`FalconKVClientImpl` 构造时从 `cfg.common.*` 读取：
+
+| JSON 字段 (`common.*`) | 默认值 | 说明 |
+|------------------------|--------|------|
+| `scheduler_enabled` | true | 是否启用 IO Scheduler 通信 |
+| `scheduler_uds_path` | /tmp/falconkv_scheduler.sock | Scheduler UDS 路径 |
+| `scheduler_rpc_timeout_us` | 2000 | Scheduler RPC 超时（微秒） |
+| `max_consecutive_failures` | 3 | SchedulerProxy 连续失败阈值 |
+| `reconnect_interval_sec` | 2 | bypass 后重连探测间隔 |
+| `node_id` | 0 | 本节点 ID |
+| `meta_addr` | localhost:18900 | Meta 服务器地址 |
+
+### 6.3 JSON client 区（专属）
+
+| JSON 字段 (`client.*`) | 默认值 | 说明 |
+|------------------------|--------|------|
+| `cache_capacity` | 100000 | Key 描述缓存容量 |
+| `async_batch_size` | 16 | 异步操作并发度 |
+| `fire_and_forget` | true | 是否启用 Fire-and-Forget Put |
+| `preallocation_count` | 1000 | 预分配 key 数量 |
+| `preallocation_enabled` | true | 是否启用预分配 |
 
 ## 7. IO Scheduler 集成
 
 ### 7.1 SchedulerProxy 在 Client 中的位置
 
 SchedulerProxy 嵌入在 `FalconKVClientImpl` 中，作为 IO 路径的一个可选拦截点。Client 在向 Scheduler 申请 IO 时，需根据亲和层级映射到对应的 IOChannel：
+
+**配置传播**：`FalconKVClientImpl` 构造时从加载的 JSON 配置中读取 `common.scheduler_enabled` 和 `common.scheduler_uds_path`，优先级高于 `FalconKVClientImpl::Config` 的默认值。这使得通过 JSON 配置文件可以控制 scheduler 行为，无需修改代码。
 
 ```
 IOChannel 映射规则:

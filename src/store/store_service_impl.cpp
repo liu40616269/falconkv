@@ -1,9 +1,11 @@
 #include "src/store/store_service_impl.h"
+#include "src/store/store_meta_index.h"
 
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
 
 #include <cstring>
+#include <unordered_map>
 #include "src/common/time_util.h"
 
 namespace falconkv {
@@ -122,23 +124,24 @@ void StoreServiceImpl::GetByKey(::google::protobuf::RpcController*,
 
     const std::string& key = request->key();
 
-    if (!store_->Contains(key)) {
+    // First look up the key to get its actual size.
+    std::vector<StoreKeyRecord> hits;
+    std::vector<std::string> misses;
+    store_->BatchContains({key}, hits, misses);
+    if (hits.empty()) {
         response->set_status(static_cast<int>(Status::kNotFound));
         return;
     }
 
-    // Get the key record to know the size
-    // We need to allocate a buffer. Use a reasonable max size.
-    // For now, use the chunk_size as the max buffer size.
-    uint32_t max_size = store_->chunk_size();
-    void* buffer = AlignedAllocator::Allocate(512, max_size);
+    uint32_t data_size = hits[0].size;
+    void* buffer = AlignedAllocator::Allocate(512, data_size);
     if (!buffer) {
         response->set_status(-1);
         return;
     }
 
     uint64_t request_ts_ns = GetCurrentTimeNs();
-    auto result = store_->Get(key, buffer, max_size);
+    auto result = store_->Get(key, buffer, data_size);
     uint64_t done_ts_ns = GetCurrentTimeNs();
 
     if (!result.status.ok()) {
@@ -174,13 +177,30 @@ void StoreServiceImpl::BatchGetByKey(::google::protobuf::RpcController*,
                                       ::google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
 
-    uint32_t chunk_size = store_->chunk_size();
+    // Batch look up all keys to get their actual sizes.
+    std::vector<std::string> keys;
+    keys.reserve(request->keys_size());
+    for (int i = 0; i < request->keys_size(); ++i) {
+        keys.push_back(request->keys(i));
+    }
+
+    std::vector<StoreKeyRecord> hits;
+    std::vector<std::string> misses;
+    store_->BatchContains(keys, hits, misses);
+
+    // Build a set of found keys with their sizes for quick lookup.
+    std::unordered_map<std::string, uint32_t> key_sizes;
+    for (const auto& rec : hits) {
+        key_sizes[rec.key] = rec.size;
+    }
+
     bool all_ok = true;
 
     for (int i = 0; i < request->keys_size(); ++i) {
         const std::string& key = request->keys(i);
 
-        if (!store_->Contains(key)) {
+        auto it = key_sizes.find(key);
+        if (it == key_sizes.end()) {
             response->add_data_segments();
             response->add_sizes(0);
             response->add_statuses(static_cast<int>(Status::kNotFound));
@@ -188,7 +208,8 @@ void StoreServiceImpl::BatchGetByKey(::google::protobuf::RpcController*,
             continue;
         }
 
-        void* buffer = AlignedAllocator::Allocate(512, chunk_size);
+        uint32_t data_size = it->second;
+        void* buffer = AlignedAllocator::Allocate(512, data_size);
         if (!buffer) {
             response->add_data_segments();
             response->add_sizes(0);
@@ -198,7 +219,7 @@ void StoreServiceImpl::BatchGetByKey(::google::protobuf::RpcController*,
         }
 
         uint64_t request_ts_ns = GetCurrentTimeNs();
-        auto result = store_->Get(key, buffer, chunk_size);
+        auto result = store_->Get(key, buffer, data_size);
         uint64_t done_ts_ns = GetCurrentTimeNs();
 
         if (!result.status.ok()) {

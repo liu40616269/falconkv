@@ -32,7 +32,7 @@ public:
         bool fire_and_forget = true;
         bool scheduler_enabled = true;
         std::string scheduler_uds_path = "/tmp/falconkv_scheduler.sock";
-        int scheduler_rpc_timeout_us = 100;
+        int scheduler_rpc_timeout_us = 2000;
     };
 
     explicit FalconKVClientImpl(const Config& config);
@@ -97,6 +97,9 @@ private:
 
     // This client's node identity for access type determination.
     uint32_t node_id_ = 0;
+
+    // Local store address (host:port) for remote-read source identification.
+    std::string local_store_addr_;
 };
 
 } // namespace falconkv

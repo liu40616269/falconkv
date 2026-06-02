@@ -11,15 +11,16 @@
 namespace falconkv {
 
 struct KeyDescriptor {
-    std::string key;
+    const std::string key;
     uint32_t store_id = 0;
     uint64_t offset = 0;
     uint32_t size = 0;
-    uint32_t chunk_size = 0;
     uint64_t access_time_ms = 0;
-    std::string data_file;
     std::string store_addr;
     AccessType access_type = AccessType::ACCESS_REMOTE_RPC;
+
+    KeyDescriptor() = default;
+    explicit KeyDescriptor(std::string k) : key(std::move(k)) {}
 };
 
 class KeyDescCache {
@@ -39,11 +40,12 @@ public:
     void Clear();
 
 private:
+    using ListIter = std::list<KeyDescriptor>::iterator;
     void EvictIfNeeded();
 
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, KeyDescriptor> cache_;
-    std::list<std::string> lru_list_;
+    std::list<KeyDescriptor> lru_list_;
+    std::unordered_map<std::string_view, ListIter> cache_;
     size_t capacity_;
 };
 

@@ -82,7 +82,6 @@ TEST(FileNaming, FallocatePreallocation) {
     config.ssd_path = tmp_dir;
     config.store_id = 42;
     config.capacity_bytes = 4 * 1024 * 1024; // 4 MB
-    config.chunk_size = 4096;
     config.page_size = 4096;
     config.disable_mtime = true;
     config.scheduler_enabled = false;

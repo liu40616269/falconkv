@@ -9,6 +9,10 @@ struct CommonConfig {
     uint32_t node_id = 0;
     bool scheduler_enabled = true;
     std::string scheduler_uds_path = "/tmp/falconkv_scheduler.sock";
+    int scheduler_rpc_timeout_us = 2000;
+    int max_consecutive_failures = 3;
+    int reconnect_interval_sec = 2;
+    std::string log_dir = "";  // glog 日志目录，空则输出到 stderr
 };
 
 struct MetaConfig {
@@ -23,7 +27,6 @@ struct StoreConfig {
     uint32_t store_id = 0;
     uint32_t node_id = 0;
     uint64_t capacity_bytes = 500ULL * 1024 * 1024 * 1024; // 500GB
-    uint32_t chunk_size = 2 * 1024 * 1024; // 2MB
     uint32_t page_size = 4096;
     uint32_t io_threads = 4;
     uint32_t alignment = 512;
@@ -32,6 +35,9 @@ struct StoreConfig {
     uint32_t buffer_pool_size = 64;
     bool scheduler_enabled = true;
     std::string scheduler_uds_path = "/tmp/falconkv_scheduler.sock";
+    int scheduler_rpc_timeout_us = 2000;
+    int max_consecutive_failures = 3;
+    int reconnect_interval_sec = 2;
     std::string store_rpc_host = "127.0.0.1";
     std::string meta_addr = "localhost:8900";
     uint32_t evict_grace_period_ms = 5000;
@@ -43,13 +49,12 @@ struct StoreConfig {
 
 struct SchedulerConfig {
     std::string uds_path = "/tmp/falconkv_scheduler.sock";
-    bool enabled = true;
     std::string schedule_policy = "passthrough";
     double ssd_bw_limit_mbps = 7000.0;
     double net_bw_limit_mbps = 12500.0;
     int stats_report_interval_sec = 5;
     int stats_window_ms = 1000;
-    int rpc_timeout_us = 100;
+    int rpc_timeout_us = 2000;
     int max_consecutive_failures = 3;
     int reconnect_interval_sec = 2;
 };
@@ -62,9 +67,10 @@ struct ClientConfig {
     bool preallocation_enabled = true;
     bool scheduler_enabled = true;
     std::string scheduler_uds_path = "/tmp/falconkv_scheduler.sock";
-    int scheduler_rpc_timeout_us = 100;
+    int scheduler_rpc_timeout_us = 2000;
+    int max_consecutive_failures = 3;
+    int reconnect_interval_sec = 2;
     uint32_t node_id = 0;
-    std::string log_dir = "";  // glog 日志目录，空则输出到 stderr
 };
 
 struct TransferConfig {

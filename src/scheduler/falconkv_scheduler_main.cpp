@@ -13,7 +13,11 @@
 static std::atomic<bool> g_stopped{false};
 
 static void SignalHandler(int signo) {
-    LOG(WARNING) << "[falconkv_scheduler] Received signal " << signo << ", shutting down...";
+    // Only use async-signal-safe operations inside signal handlers.
+    // LOG() / glog are NOT signal-safe (they use mutexes internally) and
+    // can deadlock if the signal interrupts a thread holding glog's lock.
+    const char msg[] = "[falconkv_scheduler] Received signal, shutting down...\n";
+    ssize_t unused __attribute__((unused)) = write(STDERR_FILENO, msg, sizeof(msg) - 1);
     g_stopped.store(true);
 }
 
@@ -26,10 +30,6 @@ static void InstallSignalHandlers() {
 }
 
 int main(int argc, char* argv[]) {
-#ifdef FALCONKV_HAS_GLOG
-    google::InitGoogleLogging(argv[0]);
-#endif
-
     // Determine config file path:
     // 1. Command-line argument (if provided)
     // 2. FALCONKV_CONFIG_FILE environment variable
@@ -46,12 +46,16 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    LOG(INFO) << "[falconkv_scheduler] Loading config from: " << config_file;
     falconkv::FalconKVConfig config = falconkv::ConfigLoader::LoadFromFile(config_file);
 
-    InstallSignalHandlers();
+    falconkv::InitSharedLogging(config.common.log_dir, argv[0]);
 
-    // Create and start SchedulerServer
+    LOG(INFO) << "[falconkv_scheduler] Loading config from: " << config_file;
+
+    // Create and start SchedulerServer (must be done BEFORE installing signal
+    // handlers, because brpc::Server::Start() triggers global initialization
+    // that installs its own SIGTERM handler via signal(), which would override
+    // ours if installed too early).
     falconkv::SchedulerServer server(config.scheduler);
 
     falconkv::Status s = server.Start();
@@ -59,6 +63,10 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "[falconkv_scheduler] Failed to start SchedulerServer: " << s.ToString();
         return 1;
     }
+
+    // Install signal handlers AFTER brpc initialization so that our handlers
+    // take precedence over brpc's internal SIGTERM handler.
+    InstallSignalHandlers();
 
     LOG(INFO) << "[falconkv_scheduler] SchedulerServer started on " << server.UDSPath();
 
@@ -71,9 +79,7 @@ int main(int argc, char* argv[]) {
     server.Stop();
     LOG(INFO) << "[falconkv_scheduler] Stopped.";
 
-#ifdef FALCONKV_HAS_GLOG
-    google::ShutdownGoogleLogging();
-#endif
+    falconkv::ShutdownSharedLogging();
 
     return 0;
 }

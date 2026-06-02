@@ -29,7 +29,11 @@ public:
     bool IsConnected() const { return connected_; }
 
     /// Read data from the remote store.
-    Status Read(uint64_t offset, void* buffer, uint32_t size);
+    /// @param client_id  Caller's node ID (forwarded to remote store for scheduler stats).
+    /// @param source_node_addr  Caller's store address (forwarded to remote store).
+    Status Read(uint64_t offset, void* buffer, uint32_t size,
+                uint32_t client_id = 0,
+                const std::string& source_node_addr = "");
 
     /// Ping the remote store.
     Status Ping();

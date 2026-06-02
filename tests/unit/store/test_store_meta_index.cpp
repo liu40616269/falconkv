@@ -16,7 +16,7 @@ TEST(StoreMetaIndexTest, PutAndGet) {
     rec.key = "key1";
     rec.offset = 1024;
     rec.size = 512;
-    rec.chunk_size = 2048;
+    rec.alloc_size = 2048;
     rec.stat = 1;
     rec.access_time_ms = 1000;
 
