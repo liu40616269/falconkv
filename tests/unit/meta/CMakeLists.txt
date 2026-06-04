@@ -1,5 +1,6 @@
 set(META_TESTS
-    test_buddy_allocator
+    test_slot_allocator
+    test_slot_allocator_perf
     test_meta_service_impl
     test_meta_rpc_client
     test_meta_sync_commit

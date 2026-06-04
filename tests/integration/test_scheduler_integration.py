@@ -67,8 +67,8 @@ class TestSchedulerIntegration:
 
         port = 18901
         config = {
-            "common": {"log_dir": test_log_dir},
-            "meta": {"listen_addr": f"0.0.0.0:{port}", "shard_count": 16},
+            "common": {"meta_addr": f"0.0.0.0:{port}", "log_dir": test_log_dir},
+            "meta": {"shard_count": 16},
         }
         config_file = os.path.join(temp_ssd_dir, "meta_restart_config.json")
         with open(config_file, "w") as f:

@@ -1,5 +1,5 @@
 #include "src/store/pending_evict_queue.h"
-#include "src/common/buddy_allocator.h"
+#include "src/common/slot_allocator.h"
 #include "src/common/time_util.h"
 
 #include <chrono>
@@ -7,7 +7,7 @@
 namespace falconkv {
 
 PendingEvictQueue::PendingEvictQueue(uint64_t grace_period_ms,
-                                     BuddyAllocator* allocator)
+                                     SlotAllocator* allocator)
     : grace_period_ms_(grace_period_ms), allocator_(allocator) {}
 
 PendingEvictQueue::~PendingEvictQueue() {
@@ -66,6 +66,44 @@ void PendingEvictQueue::EvictLoop() {
             allocator_->Free(static_cast<int64_t>(e.offset), e.alloc_size);
         }
     }
+}
+
+size_t PendingEvictQueue::FlushExpired() {
+    uint64_t now = GetWallTimeMs();
+    std::vector<EvictEntry> to_free;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t keep_from = 0;
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (now - entries_[i].enqueue_time_ms >= grace_period_ms_) {
+                to_free.push_back(std::move(entries_[i]));
+            } else {
+                entries_[keep_from++] = std::move(entries_[i]);
+            }
+        }
+        entries_.resize(keep_from);
+    }
+    size_t reclaimed = 0;
+    for (const auto& e : to_free) {
+        allocator_->Free(static_cast<int64_t>(e.offset), e.alloc_size);
+        reclaimed += e.alloc_size;
+    }
+    return reclaimed;
+}
+
+size_t PendingEvictQueue::FlushAllForced() {
+    std::vector<EvictEntry> remaining;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        remaining = std::move(entries_);
+        entries_.clear();
+    }
+    size_t reclaimed = 0;
+    for (const auto& e : remaining) {
+        allocator_->Free(static_cast<int64_t>(e.offset), e.alloc_size);
+        reclaimed += e.alloc_size;
+    }
+    return reclaimed;
 }
 
 void PendingEvictQueue::FlushAll() {

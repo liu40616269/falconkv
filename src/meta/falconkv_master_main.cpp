@@ -56,7 +56,7 @@ int main(int argc, char* argv[]) {
     // handlers, because brpc::Server::Start() triggers global initialization
     // that installs its own SIGTERM handler via signal(), which would override
     // ours if installed too early).
-    falconkv::MetaServer server(config.meta);
+    falconkv::MetaServer server(config.meta, config.common.meta_addr);
 
     falconkv::Status s = server.Start();
     if (!s.ok()) {

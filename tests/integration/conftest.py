@@ -108,10 +108,10 @@ def meta_server(temp_ssd_dir, test_log_dir):
     listen_port = 18900
     config = {
         "common": {
+            "meta_addr": f"0.0.0.0:{listen_port}",
             "log_dir": test_log_dir,
         },
         "meta": {
-            "listen_addr": f"0.0.0.0:{listen_port}",
             "shard_count": 16,
         },
     }
@@ -221,9 +221,6 @@ def falconkv_client(meta_server, temp_ssd_dir, test_log_dir):
             "scheduler_enabled": False,
             "log_dir": test_log_dir,
         },
-        "meta": {
-            "listen_addr": meta_server["addr"],
-        },
         "client": {
             "cache_capacity": 10000,
         },
@@ -266,7 +263,8 @@ def _make_falconkv_config(
         "capacity_gb": capacity_gb,
         "page_size": 4096,
         "io_threads": 2,
-        "buffer_pool_size": 4,
+        "io_uring_enabled": False,
+        "direct_io_enabled": True,
         "store_rpc_host": "127.0.0.1",
         "listen_port": listen_port,
     }
@@ -293,9 +291,6 @@ def _make_falconkv_config(
         "store": store_cfg,
         "client": {
             "cache_capacity": 100000,
-        },
-        "meta": {
-            "listen_addr": meta_addr,
         },
     }
     config_path = os.path.join(ssd_dir, "falconkv_config.json")

@@ -2,8 +2,7 @@
 #include "src/store/store_meta_index.h"
 #include "src/store/meta_sync_client.h"
 #include "src/store/pending_evict_queue.h"
-#include "src/common/buddy_allocator.h"
-#include "src/common/time_util.h"
+#include "src/common/slot_allocator.h"
 #include "src/common/logging.h"
 
 #include <chrono>
@@ -16,7 +15,7 @@ EvictManager::EvictManager(const Config& config,
                            StoreMetaIndex* meta_index,
                            MetaSyncClient* meta_sync_client,
                            PendingEvictQueue* pending_queue,
-                           BuddyAllocator* allocator)
+                           SlotAllocator* allocator)
     : config_(config),
       meta_index_(meta_index),
       meta_sync_client_(meta_sync_client),
@@ -58,22 +57,28 @@ void EvictManager::EvictLoop() {
 
         LOG(WARNING) << "[EvictManager] Usage " << (usage * 100)
                      << "% exceeds high watermark " << (config_.high_watermark * 100)
-                     << "%, starting eviction for store " << config_.store_id;
+                     << "%, starting LRU eviction for store " << config_.store_id;
 
         // Keep evicting until usage drops below low watermark or no more
         // candidates are available.
         while (running_.load() && allocator_->GetUsageRatio() > config_.low_watermark) {
-            if (!TryEvictBatch()) {
+            if (!TryEvictBatchLRU()) {
                 break;
             }
         }
     }
 }
 
-bool EvictManager::TryEvictBatch() {
-    uint64_t threshold = GetWallTimeMs() - config_.cold_threshold_ms;
-    // Evict at most 16 entries per batch to keep latency bounded.
-    auto candidates = meta_index_->GetColdEntries(threshold, 16);
+bool EvictManager::TryEvictBatchLRU() {
+    // Evict at most 16 entries per batch — directly from LRU tail.
+    auto candidates = meta_index_->GetLRUCandidates(16);
+    if (candidates.empty()) {
+        return false;
+    }
+    return EvictEntries(candidates);
+}
+
+bool EvictManager::EvictEntries(const std::vector<StoreKeyRecord>& candidates) {
     if (candidates.empty()) {
         return false;
     }
@@ -88,7 +93,7 @@ bool EvictManager::TryEvictBatch() {
     if (meta_sync_client_) {
         Status s = meta_sync_client_->SyncRemove(config_.store_id, keys);
         if (!s.ok()) {
-            LOG(ERROR) << "[EvictManager] TryEvictBatch: SyncRemove failed for "
+            LOG(ERROR) << "[EvictManager] EvictEntries: SyncRemove failed for "
                        << keys.size() << " keys: " << s.ToString();
             // Meta sync failed — skip this batch to keep consistency.
             return false;
@@ -102,6 +107,56 @@ bool EvictManager::TryEvictBatch() {
     }
 
     return true;
+}
+
+uint32_t EvictManager::ForceEvict(uint32_t needed_bytes) {
+    constexpr int kMaxRounds = 5;
+    constexpr size_t kMaxPerRound = 64;
+
+    uint32_t total_evicted = 0;
+
+    for (int round = 0; round < kMaxRounds; ++round) {
+        if (total_evicted >= needed_bytes) {
+            break;
+        }
+
+        uint32_t remaining = needed_bytes - total_evicted;
+        auto candidates = meta_index_->GetLRUCandidatesBySize(remaining, kMaxPerRound);
+        if (candidates.entries.empty()) {
+            break;
+        }
+
+        // Try to evict this batch.
+        std::vector<std::string> keys;
+        keys.reserve(candidates.entries.size());
+        for (const auto& rec : candidates.entries) {
+            keys.push_back(rec.key);
+        }
+
+        if (meta_sync_client_) {
+            Status s = meta_sync_client_->SyncRemove(config_.store_id, keys);
+            if (!s.ok()) {
+                LOG(ERROR) << "[EvictManager] ForceEvict: SyncRemove failed for "
+                           << keys.size() << " keys: " << s.ToString();
+                break;
+            }
+        }
+
+        // Remove from local index and enqueue.
+        for (const auto& rec : candidates.entries) {
+            meta_index_->Remove(rec.key);
+            pending_queue_->Enqueue(rec.key, rec.offset, rec.alloc_size);
+        }
+
+        total_evicted += candidates.total_alloc_size;
+    }
+
+    if (total_evicted > 0) {
+        LOG(WARNING) << "[EvictManager] ForceEvict: evicted "
+                     << total_evicted << " bytes for store " << config_.store_id;
+    }
+
+    return total_evicted;
 }
 
 } // namespace falconkv

@@ -96,6 +96,17 @@ else()
     message(FATAL_ERROR "jsoncpp is required but not found")
 endif()
 
+# Find liburing (optional, for io_uring support)
+find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
+find_library(LIBURING_LIBRARY NAMES uring)
+if(LIBURING_INCLUDE_DIR AND LIBURING_LIBRARY)
+    set(FALCONKV_HAS_IOURING TRUE)
+    message(STATUS "Found liburing: ${LIBURING_LIBRARY}")
+else()
+    set(FALCONKV_HAS_IOURING FALSE)
+    message(STATUS "liburing not found, io_uring disabled")
+endif()
+
 # Find GTest
 if(FALCONKV_BUILD_TESTS)
     find_package(GTest QUIET)

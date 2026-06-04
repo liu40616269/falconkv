@@ -10,10 +10,10 @@
 
 namespace falconkv {
 
-class BuddyAllocator;
+class SlotAllocator;
 
 /// PendingEvictQueue holds evicted key records for a grace period before
-/// reclaiming their SSD space via BuddyAllocator::Free().  The Meta
+/// reclaiming their SSD space via SlotAllocator::Free().  The Meta
 /// server has already been notified of the eviction; the grace period
 /// prevents in-flight reads from other nodes from hitting freed space.
 class PendingEvictQueue {
@@ -27,7 +27,7 @@ public:
 
     /// @param grace_period_ms  Grace period in milliseconds (default 5000).
     /// @param allocator        Borrowed pointer — must outlive this object.
-    PendingEvictQueue(uint64_t grace_period_ms, BuddyAllocator* allocator);
+    PendingEvictQueue(uint64_t grace_period_ms, SlotAllocator* allocator);
     ~PendingEvictQueue();
 
     PendingEvictQueue(const PendingEvictQueue&) = delete;
@@ -45,12 +45,21 @@ public:
     /// Return the number of entries currently waiting.
     size_t Size() const;
 
+    /// Immediately reclaim all entries whose grace period has expired.
+    /// Returns the number of bytes reclaimed.
+    size_t FlushExpired();
+
+    /// Immediately reclaim ALL pending entries, ignoring grace period.
+    /// This is a last-resort method used when forced eviction needs space
+    /// urgently. Returns the number of bytes reclaimed.
+    size_t FlushAllForced();
+
 private:
     void EvictLoop();
     void FlushAll();
 
     uint64_t grace_period_ms_;
-    BuddyAllocator* allocator_;  // not owned
+    SlotAllocator* allocator_;  // not owned
 
     mutable std::mutex mutex_;
     std::vector<EvictEntry> entries_;

@@ -1,7 +1,7 @@
 add_library(falconkv_common STATIC
     config.cpp
     status.cpp
-    buddy_allocator.cpp
+    slot_allocator.cpp
     logging.cpp
 )
 

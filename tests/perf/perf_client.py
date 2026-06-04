@@ -10,14 +10,15 @@ Architecture:
     - Client C: cross-node reader         (ACCESS_REMOTE_RPC)
 
 Key design:
-    - Client A is the sole writer. batch_idx increments continuously,
-      producing unlimited new keys (perf_A_{batch_idx}_{i}).
-    - Clients B/C only read, referencing A's previously written keys
-      (lag by 1 batch to ensure data has been synced to Meta).
-    - Before every write, batch_exist checks whether keys already exist
-      to avoid duplicate writes.
-    - capacity_gb in the config should be large enough to hold all data
-      written during warmup + benchmark (evict optimization pending).
+    - Warmup phase uses prefix ``warmup_A_{batch_idx}_{i}``.
+      Client A writes continuously during warmup to populate data.
+    - Benchmark phase uses prefix ``bench_A_{batch_idx}_{i}``.
+      Client A writes genuinely new keys (exercising the write + eviction
+      path) and reads back its own newly written data.
+    - Clients B/C only read warmup-phase data (``warmup_A_*``), which is
+      guaranteed to exist — no synchronization needed between clients.
+    - capacity_gb in the config controls when LRU eviction kicks in.
+      Use a small value (e.g. 1 GB) to stress-test the eviction path.
 """
 
 import argparse
@@ -30,25 +31,45 @@ import time
 
 
 # ---------------------------------------------------------------------------
-# Buffer helpers
+# Buffer helpers (DirectIO-aligned)
 # ---------------------------------------------------------------------------
 
-class BufferGuard:
-    """Holds a ctypes buffer alive and exposes its address/size."""
+DIRECTIO_ALIGNMENT = 4096  # Must match store page_size
 
-    def __init__(self, data: bytes):
-        self._buf = (ctypes.c_ubyte * len(data))(*data)
-        self.ptr = ctypes.addressof(self._buf)
-        self.size = len(data)
+
+def _align_up(value: int, alignment: int) -> int:
+    """Round *value* up to the nearest multiple of *alignment*."""
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+class BufferGuard:
+    """Holds a DirectIO-aligned ctypes buffer initialised with *data*.
+
+    Both the exposed pointer and size are aligned to ``DIRECTIO_ALIGNMENT``
+    so that the buffer can be used directly with O_DIRECT I/O.
+    """
+
+    def __init__(self, data: bytes, alignment: int = DIRECTIO_ALIGNMENT):
+        self.size = _align_up(len(data), alignment)
+        # Over-allocate so we can find an aligned start address.
+        self._buf = (ctypes.c_ubyte * (self.size + alignment))()
+        raw = ctypes.addressof(self._buf)
+        self.ptr = _align_up(raw, alignment)
+        ctypes.memmove(self.ptr, data, len(data))
 
 
 class ZeroBuffer:
-    """Allocated zeroed buffer of given size."""
+    """DirectIO-aligned, zeroed buffer of the requested size.
 
-    def __init__(self, size: int):
-        self._buf = (ctypes.c_ubyte * size)()
-        self.ptr = ctypes.addressof(self._buf)
-        self.size = size
+    Both the exposed pointer and size are aligned to ``DIRECTIO_ALIGNMENT``
+    so that the buffer can be used directly with O_DIRECT I/O.
+    """
+
+    def __init__(self, size: int, alignment: int = DIRECTIO_ALIGNMENT):
+        self.size = _align_up(size, alignment)
+        self._buf = (ctypes.c_ubyte * (self.size + alignment))()
+        raw = ctypes.addressof(self._buf)
+        self.ptr = _align_up(raw, alignment)
 
 
 # ---------------------------------------------------------------------------
@@ -84,15 +105,18 @@ def _write_falconkv_config(client_cfg: dict, test_cfg: dict, config: dict,
             "capacity_gb": client_cfg.get("capacity_gb", 8),
             "page_size": 4096,
             "io_threads": client_cfg.get("io_threads", 2),
-            "buffer_pool_size": client_cfg.get("buffer_pool_size", 4),
             "store_rpc_host": client_cfg.get("store_rpc_host", "127.0.0.1"),
             "listen_port": client_cfg["listen_port"],
+            "evict_grace_period_ms": client_cfg.get("evict_grace_period_ms", 5000),
+            "evict_check_interval_sec": client_cfg.get("evict_check_interval_sec", 60),
+            "evict_high_watermark": client_cfg.get("evict_high_watermark", 0.85),
+            "evict_low_watermark": client_cfg.get("evict_low_watermark", 0.70),
+            "io_uring_enabled": client_cfg.get("io_uring_enabled", False),
+            "io_uring_queue_depth": client_cfg.get("io_uring_queue_depth", 128),
+            "slot_size_bytes": client_cfg.get("slot_size_bytes", 0),
         },
         "client": {
             "cache_capacity": client_cfg.get("cache_capacity", 100000),
-        },
-        "meta": {
-            "listen_addr": meta_addr,
         },
     }
     os.makedirs(ssd_path, exist_ok=True)
@@ -106,24 +130,40 @@ def _write_falconkv_config(client_cfg: dict, test_cfg: dict, config: dict,
 # Key generation
 # ---------------------------------------------------------------------------
 
-def _generate_keys(role: str, client_id: str, batch_idx: int,
-                   batch_size: int) -> list:
-    """Generate keys for one batch iteration.
+def _warmup_keys(batch_idx: int, batch_size: int) -> list:
+    """Generate warmup-phase keys (``warmup_A_{batch_idx}_{i}``)."""
+    return [f"warmup_A_{batch_idx}_{i}" for i in range(batch_size)]
 
-    - Writer (A): produces fresh keys with the current batch_idx.
-    - Readers (B/C): reference A's *previous* batch to ensure the data
-      has already been written and synced to Meta.
+
+def _bench_write_keys(batch_idx: int, batch_size: int) -> list:
+    """Generate benchmark-phase write keys (``bench_A_{batch_idx}_{i}``).
+
+    Used by Client A to produce genuinely new keys that exercise the write
+    + LRU eviction path.
     """
-    keys = []
-    if role == "writer":
-        for i in range(batch_size):
-            keys.append(f"perf_A_{batch_idx}_{i}")
-    else:
-        # Lag behind A by 1 batch so the data is guaranteed to exist.
-        read_batch = max(0, batch_idx - 1)
-        for i in range(batch_size):
-            keys.append(f"perf_A_{read_batch}_{i}")
-    return keys
+    return [f"bench_A_{batch_idx}_{i}" for i in range(batch_size)]
+
+
+def _bench_read_keys(batch_idx: int, batch_size: int) -> list:
+    """Generate benchmark-phase read keys.
+
+    - Writer A: reads its own just-written bench keys (lag by 1 batch).
+    - Readers B/C: cycle through warmup-phase data (always exists).
+    """
+    raise NotImplementedError("use role-specific methods instead")
+
+
+def _writer_read_keys(batch_idx: int, batch_size: int) -> list:
+    """Writer A reads its own bench keys from the *previous* batch."""
+    read_batch = max(0, batch_idx - 1)
+    return [f"bench_A_{read_batch}_{i}" for i in range(batch_size)]
+
+
+def _reader_read_keys(batch_idx: int, total_warmup_batches: int,
+                      batch_size: int) -> list:
+    """Readers B/C cycle through warmup data (always exists)."""
+    warmup_batch = batch_idx % total_warmup_batches
+    return [f"warmup_A_{warmup_batch}_{i}" for i in range(batch_size)]
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +249,7 @@ def run_benchmark(config: dict, client_id: str):
     warmup_sec = test_cfg.get("warmup_sec", 10)
     duration_sec = test_cfg.get("duration_sec", 30)
     capacity_gb = client_cfg.get("capacity_gb", 8)
+    writer_warmup_only = test_cfg.get("writer_warmup_only", False)
 
     role = _get_role(client_id, client_cfg, config)
 
@@ -216,33 +257,56 @@ def run_benchmark(config: dict, client_id: str):
           f"value_size={value_size}  capacity_gb={capacity_gb}")
 
     # ---- Warmup phase -------------------------------------------------------
+    # Writer A publishes warmup_batch_count via a marker file so readers
+    # know how many warmup batches are available for cycling.
+    writer_cfg = _find_client_config(config, "A")
+    writer_ssd_path = writer_cfg["ssd_path"]
+    warmup_marker = os.path.join(writer_ssd_path, ".warmup_batch_count")
+
+    warmup_batch_count = 0
+
     if role == "writer":
         # Client A writes continuously to populate data for B/C to read.
+        # Pre-allocate write buffer once, reuse for entire warmup + bench.
         print(f"[A] Warmup: writing initial data for {warmup_sec}s ...")
-        warmup_data = os.urandom(value_size)
-        warmup_guard = BufferGuard(warmup_data)
-        warmup_batch_count = 0
+        write_data = os.urandom(value_size)
+        write_guard = BufferGuard(write_data)
         warmup_end = time.time() + warmup_sec
 
         while time.time() < warmup_end:
-            keys = _generate_keys(role, client_id,
-                                  warmup_batch_count, batch_size)
-            # Check existence before writing to avoid duplicates
-            hit_count = client.batch_exist_sync(keys)
-            if hit_count < len(keys):
-                client.batch_put_sync(
-                    keys,
-                    [warmup_guard.ptr] * len(keys),
-                    [warmup_guard.size] * len(keys),
-                )
+            keys = _warmup_keys(warmup_batch_count, batch_size)
+            client.batch_put_sync(
+                keys,
+                [write_guard.ptr] * len(keys),
+                [write_guard.size] * len(keys),
+            )
             warmup_batch_count += 1
 
+        # Publish warmup batch count for readers.
+        with open(warmup_marker, "w") as f:
+            f.write(str(warmup_batch_count))
         print(f"[A] Warmup done ({warmup_batch_count} batches).")
     else:
-        # B / C simply wait for A to finish populating data.
+        # B / C wait for A to finish populating data and publish count.
         print(f"[{client_id}] Warmup: waiting {warmup_sec}s "
               f"for Client A to write data ...")
         time.sleep(warmup_sec)
+
+        # Read the warmup batch count written by A.
+        for _ in range(30):  # retry for up to 15s
+            if os.path.exists(warmup_marker):
+                try:
+                    with open(warmup_marker) as f:
+                        warmup_batch_count = int(f.read().strip())
+                    break
+                except (ValueError, OSError):
+                    pass
+            time.sleep(0.5)
+        if warmup_batch_count == 0:
+            print(f"[{client_id}] WARNING: failed to read warmup batch count, "
+                  f"using 1 to avoid division by zero")
+            warmup_batch_count = 1
+        print(f"[{client_id}] Warmup done (A wrote {warmup_batch_count} batches).")
 
     # Allow meta sync to propagate across clients.
     print(f"[{client_id}] Waiting for meta sync ...")
@@ -260,45 +324,47 @@ def run_benchmark(config: dict, client_id: str):
     get_hit_count = 0    # keys successfully read
     get_miss_count = 0   # keys not found / failed
 
-    # Reset batch_idx to 0 so that all readers reference the same key
-    # range written by Client A during warmup.  Using warmup_batch_count
-    # would break because each client has a different warmup trajectory.
     batch_idx = 0
+
+    # Pre-allocate read buffer pool — reuse across all iterations.
+    read_buffer_pool = [ZeroBuffer(value_size) for _ in range(batch_size)]
 
     print(f"[{client_id}] Running benchmark for {duration_sec}s ...")
     t_start = time.time()
     deadline = t_start + duration_sec
 
     while time.time() < deadline:
-        keys = _generate_keys(role, client_id, batch_idx, batch_size)
+        if role == "writer" and writer_warmup_only:
+            # Writer only does warmup; idle during benchmark to avoid
+            # evicting warmup data that remote readers depend on.
+            time.sleep(1)
+            batch_idx += 1
+            continue
 
-        # 1) batch_exist — all clients
-        t0 = time.monotonic()
-        try:
-            hit_count = client.batch_exist_sync(keys)
-        except Exception:
-            errors += 1
-            hit_count = 0
-        t1 = time.monotonic()
-        exist_latencies.append((t1 - t0) * 1000)
-
-        # 2) batch_put — Client A only, conditional on existence
         if role == "writer":
-            if hit_count < len(keys):
-                # At least one key is new — attempt to write.
-                # The store internally skips keys that already exist, so
-                # it is safe to pass the full batch.
-                write_data = os.urandom(value_size)
-                write_guard = BufferGuard(write_data)
+            # --- Writer A: write new bench keys, then read previous bench keys
+            write_keys = _bench_write_keys(batch_idx, batch_size)
 
+            # 1) exist check on write keys
+            t0 = time.monotonic()
+            try:
+                hit_count = client.batch_exist_sync(write_keys)
+            except Exception:
+                errors += 1
+                hit_count = 0
+            t1 = time.monotonic()
+            exist_latencies.append((t1 - t0) * 1000)
+
+            # 2) batch_put new keys (reuse pre-allocated write_guard)
+            if hit_count < len(write_keys):
                 t0 = time.monotonic()
                 try:
                     client.batch_put_sync(
-                        keys,
-                        [write_guard.ptr] * len(keys),
-                        [write_guard.size] * len(keys),
+                        write_keys,
+                        [write_guard.ptr] * len(write_keys),
+                        [write_guard.size] * len(write_keys),
                     )
-                    put_bytes += value_size * (len(keys) - hit_count)
+                    put_bytes += value_size * (len(write_keys) - hit_count)
                     put_exec_count += 1
                 except Exception:
                     errors += 1
@@ -307,26 +373,64 @@ def run_benchmark(config: dict, client_id: str):
             else:
                 put_skip_count += 1
 
-        # 3) batch_get — all clients read the same keys
-        get_buffers = [ZeroBuffer(value_size) for _ in keys]
+            # 3) batch_get — read the previous batch (guaranteed to exist
+            #    after the first iteration).
+            if batch_idx > 0:
+                read_keys = _writer_read_keys(batch_idx, batch_size)
 
-        t0 = time.monotonic()
-        try:
-            results = client.batch_get_sync(
-                keys,
-                [b.ptr for b in get_buffers],
-                [b.size for b in get_buffers],
-            )
-            for r in results:
-                if r > 0:
-                    get_bytes += r
-                    get_hit_count += 1
-                else:
-                    get_miss_count += 1
-        except Exception:
-            errors += 1
-        t1 = time.monotonic()
-        get_latencies.append((t1 - t0) * 1000)
+                t0 = time.monotonic()
+                try:
+                    results = client.batch_get_sync(
+                        read_keys,
+                        [b.ptr for b in read_buffer_pool],
+                        [b.size for b in read_buffer_pool],
+                    )
+                    for r in results:
+                        if r > 0:
+                            get_bytes += r
+                            get_hit_count += 1
+                        else:
+                            get_miss_count += 1
+                except Exception:
+                    errors += 1
+                t1 = time.monotonic()
+                get_latencies.append((t1 - t0) * 1000)
+
+        else:
+            # --- Readers B/C: cycle through warmup data (always exists)
+            read_keys = _reader_read_keys(batch_idx, warmup_batch_count,
+                                          batch_size)
+
+            # 1) exist check
+            t0 = time.monotonic()
+            try:
+                hit_count = client.batch_exist_sync(read_keys)
+            except Exception:
+                errors += 1
+                hit_count = 0
+            t1 = time.monotonic()
+            exist_latencies.append((t1 - t0) * 1000)
+
+            # 2) batch_get — only when keys exist (warmup data may have been
+            #    evicted by LRU under small capacity)
+            if hit_count > 0:
+                t0 = time.monotonic()
+                try:
+                    results = client.batch_get_sync(
+                        read_keys,
+                        [b.ptr for b in read_buffer_pool],
+                        [b.size for b in read_buffer_pool],
+                    )
+                    for r in results:
+                        if r > 0:
+                            get_bytes += r
+                            get_hit_count += 1
+                        else:
+                            get_miss_count += 1
+                except Exception:
+                    errors += 1
+                t1 = time.monotonic()
+                get_latencies.append((t1 - t0) * 1000)
 
         batch_idx += 1
 

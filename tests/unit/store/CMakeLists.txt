@@ -9,6 +9,8 @@ set(STORE_TESTS
     test_pending_evict_queue
     test_evict_manager
     test_fd_cache
+    test_io_thread_pool
+    test_io_uring_engine
 )
 
 # Tests that require brpc (Store service / RPC)

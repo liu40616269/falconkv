@@ -1,5 +1,7 @@
 add_library(falconkv_store STATIC
     falconkv_store.cpp
+    io_thread_pool.cpp
+    io_uring_engine.cpp
     aligned_buffer_pool.cpp
     fd_cache.cpp
     node_local_accessor.cpp
@@ -27,4 +29,10 @@ target_link_libraries(falconkv_store PUBLIC
 
 if(FALCONKV_HAS_BRPC)
     target_link_libraries(falconkv_store PUBLIC falconkv_brpc_deps)
+endif()
+
+if(FALCONKV_HAS_IOURING)
+    target_compile_definitions(falconkv_store PUBLIC FALCONKV_HAS_IOURING)
+    target_include_directories(falconkv_store PUBLIC ${LIBURING_INCLUDE_DIR})
+    target_link_libraries(falconkv_store PUBLIC ${LIBURING_LIBRARY})
 endif()

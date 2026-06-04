@@ -3,7 +3,7 @@
 #include <chrono>
 
 #include "src/store/pending_evict_queue.h"
-#include "src/common/buddy_allocator.h"
+#include "src/common/slot_allocator.h"
 
 using namespace falconkv;
 
@@ -11,7 +11,7 @@ using namespace falconkv;
 // PendingEvictQueue: Enqueue + grace period expiry + space reclamation
 // ---------------------------------------------------------------------------
 TEST(PendingEvictQueueTest, EnqueueAndGracePeriod) {
-    BuddyAllocator alloc(4096 * 64, 4096);
+    SlotAllocator alloc(4096 * 64, 4096);
 
     // Allocate two chunks
     uint32_t as1 = 0, as2 = 0;
@@ -49,7 +49,7 @@ TEST(PendingEvictQueueTest, EnqueueAndGracePeriod) {
 // PendingEvictQueue: Stop flushes immediately (ignores grace period)
 // ---------------------------------------------------------------------------
 TEST(PendingEvictQueueTest, StopFlushesImmediately) {
-    BuddyAllocator alloc(4096 * 64, 4096);
+    SlotAllocator alloc(4096 * 64, 4096);
 
     uint32_t as1 = 0, as2 = 0;
     int64_t off1 = alloc.Alloc(4096, &as1);
@@ -80,7 +80,7 @@ TEST(PendingEvictQueueTest, StopFlushesImmediately) {
 // PendingEvictQueue: Entries within grace period are not freed
 // ---------------------------------------------------------------------------
 TEST(PendingEvictQueueTest, WithinGracePeriodNotFreed) {
-    BuddyAllocator alloc(4096 * 64, 4096);
+    SlotAllocator alloc(4096 * 64, 4096);
 
     uint32_t as1 = 0;
     int64_t off1 = alloc.Alloc(4096, &as1);
@@ -114,7 +114,7 @@ TEST(PendingEvictQueueTest, WithinGracePeriodNotFreed) {
 // PendingEvictQueue: Empty queue Stop is safe
 // ---------------------------------------------------------------------------
 TEST(PendingEvictQueueTest, EmptyQueueStopIsSafe) {
-    BuddyAllocator alloc(4096 * 64, 4096);
+    SlotAllocator alloc(4096 * 64, 4096);
     PendingEvictQueue queue(100, &alloc);
 
     // Start and stop without enqueuing anything

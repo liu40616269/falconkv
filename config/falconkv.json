@@ -1,6 +1,6 @@
 {
     "common": {
-        "meta_addr": "localhost:18900",
+        "meta_addr": "0.0.0.0:18900",
         "node_id": 1,
         "scheduler_enabled": true,
         "scheduler_uds_path": "/tmp/falconkv_scheduler.sock",
@@ -10,7 +10,6 @@
         "log_dir": ""
     },
     "meta": {
-        "listen_addr": "0.0.0.0:18900",
         "shard_count": 64,
         "page_size": 4096,
         "heartbeat_timeout_sec": 30
@@ -24,13 +23,16 @@
         "alignment": 512,
         "listen_port": 8901,
         "heartbeat_sec": 5,
-        "buffer_pool_size": 64,
         "store_rpc_host": "127.0.0.1",
         "evict_grace_period_ms": 5000,
         "evict_check_interval_sec": 60,
         "evict_high_watermark": 0.85,
         "evict_low_watermark": 0.70,
-        "evict_cold_threshold_ms": 300000
+        "evict_cold_threshold_ms": 300000,
+        "io_uring_enabled": true,
+        "direct_io_enabled": true,
+        "io_uring_queue_depth": 128,
+        "slot_size_bytes": 0
     },
     "scheduler": {
         "schedule_policy": "passthrough",
@@ -42,9 +44,7 @@
     "client": {
         "cache_capacity": 100000,
         "async_batch_size": 16,
-        "fire_and_forget": true,
-        "preallocation_count": 1000,
-        "preallocation_enabled": true
+        "fire_and_forget": true
     },
     "transfer": {
         "protocol": "brpc",

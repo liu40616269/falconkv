@@ -23,6 +23,7 @@
 | jsoncpp | >= 1.9 | 包管理器 | JSON 解析，配置文件加载 |
 | OpenSSL | >= 1.1 | 包管理器 | SSL/TLS，brpc 依赖 |
 | LevelDB | >= 1.22 | 包管理器 | KV 存储引擎，brpc 依赖 |
+| liburing | >= 2.0 | 包管理器 | 可选，io_uring 异步 IO 引擎（缺失时自动降级为线程池） |
 | GTest | >= 1.14 | 自动获取 | Google Test，单元测试（缺失时自动从 GitHub 拉取） |
 | Python3 | >= 3.8 | 包管理器 | 可选，仅构建 Python 绑定时需要 |
 
@@ -48,7 +49,8 @@ sudo apt install -y \
     libgflags-dev \
     libjsoncpp-dev \
     libssl-dev \
-    libleveldb-dev
+    libleveldb-dev \
+    liburing-dev
 ```
 
 **Ubuntu 各版本默认包版本参考：**
@@ -61,6 +63,7 @@ sudo apt install -y \
 | jsoncpp | 1.7.4 | 1.9.5 | 1.9.5 |
 | OpenSSL | 1.1.1 | 3.0.2 | 3.0.13 |
 | LevelDB | 1.22 | 1.23 | 1.23 |
+| liburing | 不可用 | 2.0 | 2.5 |
 
 > **注意：** Ubuntu 20.04 的 Protobuf 版本（3.6.1）偏低，建议手动安装 3.12+ 或升级系统。若遇到编译问题，参见 [2.1.4 常见问题](#214-常见问题ubuntu)。
 
@@ -124,6 +127,16 @@ sudo ninja install
 sudo ldconfig
 ```
 
+**Q: io_uring 相关测试被跳过？**
+
+io_uring 引擎需要 `liburing-dev`。若未安装，构建仍可成功，但运行时自动降级为线程池模式。安装后重新构建即可：
+
+```bash
+sudo apt install -y liburing-dev
+# 重新构建
+cd build && cmake -G Ninja -DCMAKE_BUILD_TYPE=Release .. && ninja -j$(nproc)
+```
+
 ---
 
 ### 2.2 openEuler（22.03 / 24.03）
@@ -143,7 +156,8 @@ sudo dnf install -y \
     gflags-devel \
     jsoncpp-devel \
     openssl-devel \
-    leveldb-devel
+    leveldb-devel \
+    liburing-devel
 ```
 
 **openEuler 各版本包可用性参考：**
@@ -156,6 +170,7 @@ sudo dnf install -y \
 | jsoncpp | jsoncpp-devel | jsoncpp-devel | 通常可用 |
 | OpenSSL | openssl-devel | openssl-devel | 系统自带 |
 | LevelDB | leveldb-devel | leveldb-devel | 可能需 EPL 仓库 |
+| liburing | liburing-devel | liburing-devel | 可能需 EPL 仓库 |
 
 > **注意：** 若部分 `-devel` 包无法直接安装，请先启用 EPL 仓库：
 > ```bash
@@ -294,11 +309,11 @@ ninja -j$(nproc)
 ./build.sh test
 ```
 
-此命令会运行全部 24 个单元测试。也可手动运行指定测试：
+此命令会运行全部 34 个单元测试。也可手动运行指定测试：
 
 ```bash
 cd build
-ctest --output-on-failure -R test_buddy_allocator    # 运行单个测试
+ctest --output-on-failure -R test_slot_allocator    # 运行单个测试
 ctest --output-on-failure -j$(nproc)                  # 并行运行全部测试
 ```
 
@@ -457,7 +472,7 @@ ls build/src/scheduler/falconkv_sched   # Scheduler 服务可执行文件
 预期输出：
 
 ```
-100% tests passed, 0 tests failed out of 24
+100% tests passed, 0 tests failed out of 34
 ```
 
 ### 4.3 验证安装
@@ -476,7 +491,7 @@ FalconKV
 ├── falconkv_common  ──→ glog, jsoncpp, pthread
 ├── falconkv_proto   ──→ protobuf
 ├── falconkv_meta    ──→ brpc (→ openssl, gflags, glog, leveldb)
-├── falconkv_store   ──→ brpc
+├── falconkv_store   ──→ brpc, liburing (可选)
 ├── falconkv_transfer ──→ brpc
 ├── falconkv_scheduler ──→ brpc
 └── falconkv_client  ──→ 以上所有模块

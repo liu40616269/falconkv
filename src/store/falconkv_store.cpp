@@ -4,7 +4,9 @@
 #include "src/store/meta_sync_client.h"
 #include "src/store/pending_evict_queue.h"
 #include "src/store/evict_manager.h"
-#include "src/common/buddy_allocator.h"
+#include "src/store/io_thread_pool.h"
+#include "src/store/io_uring_engine.h"
+#include "src/common/slot_allocator.h"
 #include "src/common/logging.h"
 #include "src/common/time_util.h"
 
@@ -62,6 +64,10 @@ FalconKVStore::Config FalconKVStore::Config::FromStoreConfig(const StoreConfig& 
     cfg.evict_high_watermark = sc.evict_high_watermark;
     cfg.evict_low_watermark = sc.evict_low_watermark;
     cfg.evict_cold_threshold_ms = sc.evict_cold_threshold_ms;
+    cfg.io_uring_enabled = sc.io_uring_enabled;
+    cfg.direct_io_enabled = sc.direct_io_enabled;
+    cfg.io_uring_queue_depth = sc.io_uring_queue_depth;
+    cfg.slot_size_bytes = sc.slot_size_bytes;
     return cfg;
 }
 
@@ -103,12 +109,32 @@ Status FalconKVStore::Init(const std::string& meta_addr) {
     buffer_pool_ = std::make_unique<AlignedBufferPool>(
         kDefaultBufferSize, config_.page_size, config_.io_threads * 2);
 
-    // Initialize BuddyAllocator for space management.
-    allocator_ = std::make_unique<BuddyAllocator>(
-        config_.capacity_bytes, config_.page_size);
+    // Initialize SlotAllocator for space management.
+    allocator_ = std::make_unique<SlotAllocator>(
+        config_.capacity_bytes, config_.slot_size_bytes);
 
     // Initialize local metadata index.
     meta_index_ = std::make_unique<StoreMetaIndex>();
+
+    // Initialize IO thread pool (always needed as fallback).
+    io_pool_ = std::make_unique<IOThreadPool>(config_.io_threads);
+    io_pool_->Start();
+
+    // Initialize io_uring engine (optional, gracefully degrades).
+    if (config_.io_uring_enabled) {
+        io_uring_engine_ = std::make_unique<IOUringEngine>();
+        io_uring_enabled_ = io_uring_engine_->Init(
+            IOUringEngine::Config{config_.io_uring_queue_depth});
+        if (io_uring_enabled_) {
+            LOG(INFO) << "[FalconKVStore] io_uring enabled (queue_depth="
+                      << config_.io_uring_queue_depth << ")";
+        } else {
+            LOG(INFO) << "[FalconKVStore] io_uring not available, using thread pool fallback";
+        }
+    } else {
+        io_uring_enabled_ = false;
+        LOG(INFO) << "[FalconKVStore] io_uring disabled by config";
+    }
 
     // Initialize MetaSyncClient.
     meta_sync_client_ = std::make_unique<MetaSyncClient>();
@@ -153,62 +179,67 @@ Status FalconKVStore::Init(const std::string& meta_addr) {
 }
 
 // ---------------------------------------------------------------------------
-// InitDataFile - open data file with O_DIRECT, preallocate capacity
+// InitDataFile - open data file with dual-fd: buffered (always) + O_DIRECT (optional)
 // ---------------------------------------------------------------------------
 Status FalconKVStore::InitDataFile() {
-    int flags = O_CREAT | O_RDWR | O_DIRECT;
+    // 1. Always open a buffered fd (no O_DIRECT).
+    int buf_flags = O_CREAT | O_RDWR;
     if (config_.disable_mtime) {
-        flags |= O_NOATIME;
+        buf_flags |= O_NOATIME;
     }
 
-    data_fd_ = open(data_file_.c_str(), flags, 0644);
-    if (data_fd_ < 0) {
-        LOG(ERROR) << "[FalconKVStore] Failed to open data file: " << data_file_
+    data_fd_buffered_ = open(data_file_.c_str(), buf_flags, 0644);
+    if (data_fd_buffered_ < 0) {
+        LOG(ERROR) << "[FalconKVStore] Failed to open data file (buffered): " << data_file_
                    << ": " << strerror(errno);
         return Status::IoError("Failed to open data file: " + data_file_ +
                                ": " + strerror(errno));
     }
 
-    // Preallocate the file to the configured capacity.
-    int rc = posix_fallocate(data_fd_, 0, static_cast<off_t>(config_.capacity_bytes));
+    // 2. If config enables O_DIRECT, open a second fd with O_DIRECT.
+    if (config_.direct_io_enabled) {
+        int direct_flags = buf_flags | O_DIRECT;
+        data_fd_ = open(data_file_.c_str(), direct_flags, 0644);
+        if (data_fd_ < 0) {
+            LOG(WARNING) << "[FalconKVStore] O_DIRECT open failed, falling back to buffered only: "
+                         << strerror(errno);
+            config_.direct_io_enabled = false;
+        }
+    } else {
+        data_fd_ = -1;
+        LOG(INFO) << "[FalconKVStore] Direct IO disabled by config";
+    }
+
+    // 3. Preallocate the file to the configured capacity (on buffered fd).
+    int rc = posix_fallocate(data_fd_buffered_, 0, static_cast<off_t>(config_.capacity_bytes));
     if (rc != 0) {
-        // Some filesystems do not support fallocate with O_DIRECT; try truncate.
-        if (ftruncate(data_fd_, static_cast<off_t>(config_.capacity_bytes)) != 0) {
+        // Some filesystems do not support fallocate; try truncate.
+        if (ftruncate(data_fd_buffered_, static_cast<off_t>(config_.capacity_bytes)) != 0) {
             LOG(ERROR) << "[FalconKVStore] Failed to preallocate data file: " << data_file_
                        << ": fallocate error=" << strerror(rc)
                        << ", ftruncate error=" << strerror(errno);
-            close(data_fd_);
-            data_fd_ = -1;
+            close(data_fd_buffered_);
+            data_fd_buffered_ = -1;
+            if (data_fd_ >= 0) {
+                close(data_fd_);
+                data_fd_ = -1;
+            }
             return Status::IoError("Failed to preallocate data file: " +
                                    data_file_ + ": " + strerror(rc));
         }
     }
 
-    // Advise sequential access for write patterns.
-    posix_fadvise(data_fd_, 0, 0, POSIX_FADV_DONTNEED);
+    // 4. Advise the kernel we don't need this data cached.
+    posix_fadvise(data_fd_buffered_, 0, 0, POSIX_FADV_DONTNEED);
 
     return Status::OK();
 }
 
 // ---------------------------------------------------------------------------
-// AllocateAlignedBuffer / FreeAlignedBuffer
-// ---------------------------------------------------------------------------
-void* FalconKVStore::AllocateAlignedBuffer(uint32_t size) {
-    if (buffer_pool_ && buffer_pool_->buffer_size() >= size) {
-        return buffer_pool_->Get();
-    }
-    return AlignedAllocator::Allocate(config_.page_size, size);
-}
-
-void FalconKVStore::FreeAlignedBuffer(void* buf) {
-    AlignedAllocator::Free(buf);
-}
-
-// ---------------------------------------------------------------------------
-// Write - single write with DirectIO alignment handling
+// Write - single write with dual-fd: use O_DIRECT fd when aligned, buffered fd otherwise
 // ---------------------------------------------------------------------------
 Status FalconKVStore::Write(uint64_t offset, const void* data, uint32_t size) {
-    if (data_fd_ < 0) {
+    if (data_fd_buffered_ < 0) {
         LOG(ERROR) << "[FalconKVStore] Write: data file not initialized";
         return Status::IoError("Data file not initialized");
     }
@@ -219,81 +250,31 @@ Status FalconKVStore::Write(uint64_t offset, const void* data, uint32_t size) {
 
     uint32_t page_size = config_.page_size;
 
-    // Fast path: offset and size are already page-aligned, and data is
-    // sufficiently aligned for O_DIRECT.
-    bool offset_aligned = IsAligned(offset, page_size);
-    bool size_aligned = IsAligned(size, page_size);
-    uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
-    bool data_aligned = IsAligned(data_addr, page_size);
-
-    if (offset_aligned && size_aligned && data_aligned) {
-        // Direct write without copying.
-        ssize_t written = pwrite(data_fd_, data, size, static_cast<off_t>(offset));
-        if (written != static_cast<ssize_t>(size)) {
-            LOG(ERROR) << "[FalconKVStore] Write failed at offset " << offset
-                       << ", size=" << size << ": " << strerror(errno);
-            return Status::IoError("Write failed at offset " + std::to_string(offset) +
-                                   ": " + strerror(errno));
-        }
-        return Status::OK();
+    // Select fd: use O_DIRECT fd when all alignment conditions are met,
+    // otherwise fall back to the buffered fd.
+    int fd = data_fd_buffered_;
+    if (config_.direct_io_enabled && data_fd_ >= 0 &&
+        IsAligned(offset, page_size) &&
+        IsAligned(size, page_size) &&
+        IsAligned(reinterpret_cast<uintptr_t>(data), page_size)) {
+        fd = data_fd_;
     }
 
-    // Slow path: need an aligned buffer to satisfy O_DIRECT requirements.
-    uint64_t aligned_offset = offset & ~(static_cast<uint64_t>(page_size) - 1);
-    uint64_t end = offset + size;
-    uint64_t aligned_end = AlignUp(end, page_size);
-    uint32_t aligned_size = static_cast<uint32_t>(aligned_end - aligned_offset);
-
-    void* aligned_buf = AlignedAllocator::Allocate(page_size, aligned_size);
-    if (!aligned_buf) {
-        LOG(ERROR) << "[FalconKVStore] Write: failed to allocate aligned buffer, size="
-                   << aligned_size;
-        return Status::IoError("Write: failed to allocate aligned buffer");
-    }
-
-    // Read-modify-write: first read the existing data in the head/tail regions
-    // that we are not fully overwriting.
-    bool need_head_fill = (offset > aligned_offset);
-    bool need_tail_fill = (end < aligned_end);
-
-    if (need_head_fill || need_tail_fill) {
-        ssize_t rd = pread(data_fd_, aligned_buf, aligned_size,
-                           static_cast<off_t>(aligned_offset));
-        if (rd < 0) {
-            AlignedAllocator::Free(aligned_buf);
-            LOG(ERROR) << "[FalconKVStore] Write: read-modify-write pread failed at offset "
-                       << aligned_offset << ": " << strerror(errno);
-            return Status::IoError("Write: read-modify-write pread failed: " +
-                                   std::string(strerror(errno)));
-        }
-    }
-
-    // Copy user data into the aligned buffer at the correct position.
-    uint32_t copy_offset = static_cast<uint32_t>(offset - aligned_offset);
-    memcpy(static_cast<uint8_t*>(aligned_buf) + copy_offset, data, size);
-
-    // Write the full aligned block.
-    ssize_t written = pwrite(data_fd_, aligned_buf, aligned_size,
-                             static_cast<off_t>(aligned_offset));
-    AlignedAllocator::Free(aligned_buf);
-
-    if (written != static_cast<ssize_t>(aligned_size)) {
-        LOG(ERROR) << "[FalconKVStore] Write failed (aligned) at offset "
-                   << aligned_offset << ", size=" << aligned_size
-                   << ": " << strerror(errno);
-        return Status::IoError("Write failed (aligned) at offset " +
-                               std::to_string(aligned_offset) +
+    ssize_t written = pwrite(fd, data, size, static_cast<off_t>(offset));
+    if (written != static_cast<ssize_t>(size)) {
+        LOG(ERROR) << "[FalconKVStore] Write failed at offset " << offset
+                   << ", size=" << size << ": " << strerror(errno);
+        return Status::IoError("Write failed at offset " + std::to_string(offset) +
                                ": " + strerror(errno));
     }
-
     return Status::OK();
 }
 
 // ---------------------------------------------------------------------------
-// Read - single read with DirectIO alignment handling
+// Read - single read with dual-fd: use O_DIRECT fd when aligned, buffered fd otherwise
 // ---------------------------------------------------------------------------
 Status FalconKVStore::Read(uint64_t offset, void* buffer, uint32_t size) {
-    if (data_fd_ < 0) {
+    if (data_fd_buffered_ < 0) {
         LOG(ERROR) << "[FalconKVStore] Read: data file not initialized";
         return Status::IoError("Data file not initialized");
     }
@@ -304,161 +285,143 @@ Status FalconKVStore::Read(uint64_t offset, void* buffer, uint32_t size) {
 
     uint32_t page_size = config_.page_size;
 
-    bool offset_aligned = IsAligned(offset, page_size);
-    bool size_aligned = IsAligned(size, page_size);
-    uintptr_t buf_addr = reinterpret_cast<uintptr_t>(buffer);
-    bool buf_aligned = IsAligned(buf_addr, page_size);
-
-    if (offset_aligned && size_aligned && buf_aligned) {
-        ssize_t rd = pread(data_fd_, buffer, size, static_cast<off_t>(offset));
-        if (rd < 0) {
-            LOG(ERROR) << "[FalconKVStore] Read failed at offset " << offset
-                       << ", size=" << size << ": " << strerror(errno);
-            return Status::IoError("Read failed at offset " + std::to_string(offset) +
-                                   ": " + strerror(errno));
-        }
-        if (rd < static_cast<ssize_t>(size)) {
-            LOG(ERROR) << "[FalconKVStore] Short read at offset " << offset
-                       << ": expected " << size << " got " << rd;
-            return Status::IoError("Short read at offset " + std::to_string(offset) +
-                                   ": expected " + std::to_string(size) +
-                                   " got " + std::to_string(rd));
-        }
-        return Status::OK();
+    // Select fd: use O_DIRECT fd when all alignment conditions are met,
+    // otherwise fall back to the buffered fd.
+    int fd = data_fd_buffered_;
+    if (config_.direct_io_enabled && data_fd_ >= 0 &&
+        IsAligned(offset, page_size) &&
+        IsAligned(size, page_size) &&
+        IsPtrAligned(buffer, page_size)) {
+        fd = data_fd_;
     }
 
-    // Slow path: need aligned buffer.
-    uint64_t aligned_offset = offset & ~(static_cast<uint64_t>(page_size) - 1);
-    uint64_t end = offset + size;
-    uint64_t aligned_end = AlignUp(end, page_size);
-    uint32_t aligned_size = static_cast<uint32_t>(aligned_end - aligned_offset);
-
-    void* aligned_buf = AlignedAllocator::Allocate(page_size, aligned_size);
-    if (!aligned_buf) {
-        LOG(ERROR) << "[FalconKVStore] Read: failed to allocate aligned buffer, size="
-                   << aligned_size;
-        return Status::IoError("Read: failed to allocate aligned buffer");
-    }
-
-    ssize_t rd = pread(data_fd_, aligned_buf, aligned_size,
-                       static_cast<off_t>(aligned_offset));
+    ssize_t rd = pread(fd, buffer, size, static_cast<off_t>(offset));
     if (rd < 0) {
-        AlignedAllocator::Free(aligned_buf);
-        LOG(ERROR) << "[FalconKVStore] Read failed (aligned) at offset "
-                   << aligned_offset << ", size=" << aligned_size
-                   << ": " << strerror(errno);
-        return Status::IoError("Read failed (aligned) at offset " +
-                               std::to_string(aligned_offset) +
+        LOG(ERROR) << "[FalconKVStore] Read failed at offset " << offset
+                   << ", size=" << size << ": " << strerror(errno);
+        return Status::IoError("Read failed at offset " + std::to_string(offset) +
                                ": " + strerror(errno));
     }
-
-    // Copy the relevant portion into the user buffer.
-    uint32_t copy_offset = static_cast<uint32_t>(offset - aligned_offset);
-    uint32_t copy_size = std::min(size, static_cast<uint32_t>(rd) - copy_offset);
-    memcpy(buffer, static_cast<uint8_t*>(aligned_buf) + copy_offset, copy_size);
-    AlignedAllocator::Free(aligned_buf);
-
-    if (copy_size < size) {
-        LOG(ERROR) << "[FalconKVStore] Short read (aligned) at offset " << offset
-                   << ": expected " << size << " got " << copy_size;
+    if (rd < static_cast<ssize_t>(size)) {
+        LOG(ERROR) << "[FalconKVStore] Short read at offset " << offset
+                   << ": expected " << size << " got " << rd;
         return Status::IoError("Short read at offset " + std::to_string(offset) +
                                ": expected " + std::to_string(size) +
-                               " got " + std::to_string(copy_size));
+                               " got " + std::to_string(rd));
     }
-
     return Status::OK();
 }
 
 // ---------------------------------------------------------------------------
-// BatchWrite - sort by offset, perform sequential writes
+// BatchWrite - parallel writes via io_uring or thread pool
 // ---------------------------------------------------------------------------
 Status FalconKVStore::BatchWrite(const std::vector<WriteItem>& items) {
     if (items.empty()) {
         return Status::OK();
     }
 
-    // Sort items by offset to enable sequential IO.
-    std::vector<size_t> indices(items.size());
-    for (size_t i = 0; i < items.size(); ++i) {
-        indices[i] = i;
-    }
-    std::sort(indices.begin(), indices.end(), [&items](size_t a, size_t b) {
-        return items[a].offset < items[b].offset;
-    });
-
-    // Write items sequentially.
-    Status last_error = Status::OK();
-    uint32_t fail_count = 0;
-    for (size_t idx : indices) {
-        const auto& item = items[idx];
-        Status s = Write(item.offset, item.data, item.size);
-        if (!s.ok()) {
-            LOG(ERROR) << "[FalconKVStore] BatchWrite: write failed at offset "
-                       << item.offset << ": " << s.ToString();
-            last_error = s;
-            ++fail_count;
+    if (io_uring_enabled_) {
+        std::vector<UringIORequest> reqs(items.size());
+        for (size_t i = 0; i < items.size(); ++i) {
+            reqs[i].offset = items[i].offset;
+            reqs[i].size = items[i].size;
+            reqs[i].buffer = const_cast<void*>(items[i].data);
+            // Per-request fd selection: use O_DIRECT fd when all alignment
+            // conditions are met, otherwise fall back to buffered fd.
+            if (config_.direct_io_enabled && data_fd_ >= 0 &&
+                IsAligned(items[i].offset, config_.page_size) &&
+                IsAligned(items[i].size, config_.page_size) &&
+                IsAligned(reinterpret_cast<uintptr_t>(items[i].data), config_.page_size)) {
+                reqs[i].fd = data_fd_;
+            } else {
+                reqs[i].fd = data_fd_buffered_;
+            }
         }
-    }
-
-    if (fail_count > 0) {
+        // Pass -1 as batch-level fd; each request carries its own fd.
+        auto results = io_uring_engine_->BatchWrite(/*fd=*/-1, reqs);
+        Status last_error = Status::OK();
+        for (auto& r : results) {
+            if (!r.status.ok()) {
+                LOG(ERROR) << "[FalconKVStore] BatchWrite (io_uring): write failed at index "
+                           << r.index << ": " << r.status.ToString();
+                last_error = r.status;
+            }
+        }
         return last_error;
     }
-    return Status::OK();
+
+    // Fallback: thread pool
+    std::vector<std::function<Status()>> tasks;
+    tasks.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        tasks.push_back([this, &items, i]() {
+            return Write(items[i].offset, items[i].data, items[i].size);
+        });
+    }
+    auto statuses = io_pool_->SubmitAndWait(std::move(tasks));
+    Status last_error = Status::OK();
+    for (auto& s : statuses) {
+        if (!s.ok()) {
+            last_error = s;
+        }
+    }
+    return last_error;
 }
 
 // ---------------------------------------------------------------------------
-// BatchRead - parallel reads using std::async
+// BatchRead - parallel reads via io_uring or thread pool
 // ---------------------------------------------------------------------------
 Status FalconKVStore::BatchRead(const std::vector<ReadItem>& items) {
     if (items.empty()) {
         return Status::OK();
     }
 
-    // Launch async reads. We limit concurrency to io_threads.
-    size_t num_threads = std::min(static_cast<size_t>(config_.io_threads), items.size());
-
-    // For small batches, just run sequentially.
-    if (items.size() <= 2 || num_threads <= 1) {
-        for (const auto& item : items) {
-            Status s = Read(item.offset, item.buffer, item.size);
-            if (!s.ok()) {
-                return s;
+    if (io_uring_enabled_) {
+        std::vector<UringIORequest> reqs(items.size());
+        for (size_t i = 0; i < items.size(); ++i) {
+            reqs[i].offset = items[i].offset;
+            reqs[i].size = items[i].size;
+            reqs[i].buffer = items[i].buffer;
+            // Per-request fd selection: use O_DIRECT fd when all alignment
+            // conditions are met, otherwise fall back to buffered fd.
+            if (config_.direct_io_enabled && data_fd_ >= 0 &&
+                IsAligned(items[i].offset, config_.page_size) &&
+                IsAligned(items[i].size, config_.page_size) &&
+                IsPtrAligned(items[i].buffer, config_.page_size)) {
+                reqs[i].fd = data_fd_;
+            } else {
+                reqs[i].fd = data_fd_buffered_;
             }
         }
-        return Status::OK();
-    }
-
-    // Split items among workers.
-    std::vector<std::future<Status>> futures;
-    futures.reserve(num_threads);
-
-    size_t items_per_thread = (items.size() + num_threads - 1) / num_threads;
-
-    for (size_t t = 0; t < num_threads; ++t) {
-        size_t start = t * items_per_thread;
-        size_t end = std::min(start + items_per_thread, items.size());
-        if (start >= end) break;
-
-        futures.push_back(std::async(std::launch::async, [this, &items, start, end]() {
-            for (size_t i = start; i < end; ++i) {
-                Status s = Read(items[i].offset, items[i].buffer, items[i].size);
-                if (!s.ok()) {
-                    return s;
-                }
+        // Pass -1 as batch-level fd; each request carries its own fd.
+        auto results = io_uring_engine_->BatchRead(/*fd=*/-1, reqs);
+        Status last_error = Status::OK();
+        for (auto& r : results) {
+            if (!r.status.ok()) {
+                LOG(ERROR) << "[FalconKVStore] BatchRead (io_uring): read failed at index "
+                           << r.index << ": " << r.status.ToString();
+                last_error = r.status;
             }
-            return Status::OK();
-        }));
+        }
+        return last_error;
     }
 
-    // Collect results.
-    for (auto& f : futures) {
-        Status s = f.get();
+    // Fallback: thread pool
+    std::vector<std::function<Status()>> tasks;
+    tasks.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        tasks.push_back([this, &items, i]() {
+            return Read(items[i].offset, items[i].buffer, items[i].size);
+        });
+    }
+    auto statuses = io_pool_->SubmitAndWait(std::move(tasks));
+    Status last_error = Status::OK();
+    for (auto& s : statuses) {
         if (!s.ok()) {
-            return s;
+            last_error = s;
         }
     }
-
-    return Status::OK();
+    return last_error;
 }
 
 // ---------------------------------------------------------------------------
@@ -476,13 +439,39 @@ StorePutResult FalconKVStore::Put(const std::string& key, const void* data,
         return result;
     }
 
-    // 1. Allocate space via BuddyAllocator
+    // 1. Allocate space via SlotAllocator
     uint32_t alloc_size = 0;
     int64_t offset = allocator_->Alloc(size, &alloc_size);
     if (offset < 0) {
-        LOG(WARNING) << "[FalconKVStore] Put: out of space for key: " << key;
-        result.status = Status::NoSpace("Store out of space for key: " + key);
-        return result;
+        LOG(WARNING) << "[FalconKVStore] Put: out of space for key: " << key
+                     << ", triggering forced eviction";
+
+        // Level 1: Flush expired pending evictions and retry.
+        pending_evict_queue_->FlushExpired();
+        offset = allocator_->Alloc(size, &alloc_size);
+
+        // Level 2: Force evict LRU entries + flush expired and retry.
+        // Evict at least 5% of total capacity to amortize the cost.
+        if (offset < 0) {
+            uint32_t evict_target = std::max(
+                size, static_cast<uint32_t>(allocator_->GetTotalBytes() / 20));
+            evict_manager_->ForceEvict(evict_target);
+            pending_evict_queue_->FlushExpired();
+            offset = allocator_->Alloc(size, &alloc_size);
+        }
+
+        // Level 3: Flush ALL pending evictions (ignore grace period) and retry.
+        if (offset < 0) {
+            pending_evict_queue_->FlushAllForced();
+            offset = allocator_->Alloc(size, &alloc_size);
+        }
+
+        if (offset < 0) {
+            LOG(ERROR) << "[FalconKVStore] Put: still out of space after forced eviction for key: "
+                       << key;
+            result.status = Status::NoSpace("Store out of space for key: " + key);
+            return result;
+        }
     }
 
     result.offset = static_cast<uint64_t>(offset);
@@ -518,7 +507,10 @@ StorePutResult FalconKVStore::Put(const std::string& key, const void* data,
 }
 
 // ---------------------------------------------------------------------------
-// Key-aware API: BatchPut
+// Key-aware API: BatchPut (three-phase pipeline)
+// Phase 1: Batch allocate space (sequential, allocator is thread-safe)
+// Phase 2: Parallel IO write (io_uring or thread pool)
+// Phase 3: Batch metadata update + Meta sync
 // ---------------------------------------------------------------------------
 std::vector<StorePutResult> FalconKVStore::BatchPut(
     const std::vector<std::string>& keys,
@@ -536,60 +528,118 @@ std::vector<StorePutResult> FalconKVStore::BatchPut(
         return results;
     }
 
-    std::vector<StoreKeyRecord> committed_records;
-
+    // ---- Phase 1: Batch allocate space ----
+    // First, identify which keys need allocation (skip existing ones).
+    std::vector<size_t> need_alloc_indices;
     for (size_t i = 0; i < keys.size(); ++i) {
         auto& result = results[i];
-
-        // 0. Skip if key already exists — avoid space leak from overwriting
-        //    the old StoreKeyRecord without freeing its allocated offset.
         if (meta_index_->Get(keys[i]).has_value()) {
-            LOG(INFO) << "[FalconKVStore] BatchPut: key already exists, skipping: "
-                      << keys[i];
             result.status = Status::OK();
             continue;
         }
-
-        // 1. Allocate space
-        uint32_t alloc_size = 0;
-        int64_t offset = allocator_->Alloc(sizes[i], &alloc_size);
-        if (offset < 0) {
-            LOG(WARNING) << "[FalconKVStore] BatchPut: out of space for key: " << keys[i];
-            result.status = Status::NoSpace("Store out of space for key: " + keys[i]);
-            continue;
-        }
-
-        result.offset = static_cast<uint64_t>(offset);
-        result.alloc_size = alloc_size;
-
-        // 2. Write data
-        Status write_status = Write(static_cast<uint64_t>(offset),
-                                    data_ptrs[i], sizes[i]);
-        if (!write_status.ok()) {
-            allocator_->Free(offset, alloc_size);
-            LOG(ERROR) << "[FalconKVStore] BatchPut: write failed for key: " << keys[i]
-                       << " at offset " << offset << ": " << write_status.ToString();
-            result.status = write_status;
-            continue;
-        }
-
-        // 3. Record in local metadata index
-        StoreKeyRecord record;
-        record.key = keys[i];
-        record.offset = result.offset;
-        record.size = sizes[i];
-        record.alloc_size = alloc_size;
-        record.stat = 1;
-        record.access_time_ms = GetWallTimeMs();
-        meta_index_->Put(keys[i], record);
-        committed_records.push_back(record);
-
-        result.status = Status::OK();
+        need_alloc_indices.push_back(i);
     }
 
-    // 4. Batch sync to Meta
+    // Batch-allocate all needed slots in one lock acquisition.
+    if (!need_alloc_indices.empty()) {
+        uint32_t alloc_size = 0;
+        std::vector<int64_t> batch_offsets;
+        uint32_t alloc_count = allocator_->BatchAlloc(
+            sizes[need_alloc_indices[0]],
+            static_cast<uint32_t>(need_alloc_indices.size()),
+            batch_offsets, &alloc_size);
+
+        // Assign successfully allocated offsets
+        for (uint32_t j = 0; j < alloc_count; ++j) {
+            size_t idx = need_alloc_indices[j];
+            results[idx].offset = static_cast<uint64_t>(batch_offsets[j]);
+            results[idx].alloc_size = alloc_size;
+            results[idx].status = Status::OK();
+        }
+
+        // Handle keys that could not be allocated (out of space with eviction)
+        for (size_t j = alloc_count; j < need_alloc_indices.size(); ++j) {
+            size_t idx = need_alloc_indices[j];
+            LOG(WARNING) << "[FalconKVStore] BatchPut: out of space for key: " << keys[idx]
+                         << ", triggering forced eviction";
+
+            pending_evict_queue_->FlushExpired();
+            int64_t offset = allocator_->Alloc(sizes[idx], &alloc_size);
+
+            if (offset < 0) {
+                uint32_t evict_target = std::max(
+                    sizes[idx], static_cast<uint32_t>(allocator_->GetTotalBytes() / 20));
+                evict_manager_->ForceEvict(evict_target);
+                pending_evict_queue_->FlushExpired();
+                offset = allocator_->Alloc(sizes[idx], &alloc_size);
+            }
+
+            if (offset < 0) {
+                pending_evict_queue_->FlushAllForced();
+                offset = allocator_->Alloc(sizes[idx], &alloc_size);
+            }
+
+            if (offset < 0) {
+                LOG(ERROR) << "[FalconKVStore] BatchPut: still out of space after forced eviction for key: "
+                           << keys[idx];
+                results[idx].status = Status::NoSpace("Store out of space for key: " + keys[idx]);
+            } else {
+                results[idx].offset = static_cast<uint64_t>(offset);
+                results[idx].alloc_size = alloc_size;
+                results[idx].status = Status::OK();
+            }
+        }
+    }
+
+    // ---- Phase 2: Parallel IO write ----
+    // Collect all items that need to be written.
+    std::vector<WriteItem> write_items;
+    std::vector<size_t> write_indices; // maps write_items index -> original index
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!results[i].status.ok() ||
+            (results[i].offset == 0 && results[i].alloc_size == 0)) {
+            // Skip: allocation failed or key already exists (offset=0, alloc_size=0)
+            continue;
+        }
+        write_items.push_back({results[i].offset, data_ptrs[i], sizes[i]});
+        write_indices.push_back(i);
+    }
+
+    if (!write_items.empty()) {
+        Status write_status = BatchWrite(write_items);
+        if (!write_status.ok()) {
+            // On failure, mark all written items as failed and free space.
+            for (size_t j = 0; j < write_items.size(); ++j) {
+                size_t orig_idx = write_indices[j];
+                results[orig_idx].status = write_status;
+                allocator_->Free(static_cast<int64_t>(results[orig_idx].offset),
+                                 results[orig_idx].alloc_size);
+                results[orig_idx].offset = 0;
+                results[orig_idx].alloc_size = 0;
+            }
+            return results;
+        }
+    }
+
+    // ---- Phase 3: Batch metadata update + Meta sync ----
+    std::vector<StoreKeyRecord> committed_records;
+    for (size_t j = 0; j < write_items.size(); ++j) {
+        size_t orig_idx = write_indices[j];
+        StoreKeyRecord record;
+        record.key = keys[orig_idx];
+        record.offset = results[orig_idx].offset;
+        record.size = sizes[orig_idx];
+        record.alloc_size = results[orig_idx].alloc_size;
+        record.stat = 1;
+        record.access_time_ms = GetWallTimeMs();
+        meta_index_->Put(keys[orig_idx], record);
+        committed_records.push_back(record);
+        results[orig_idx].status = Status::OK();
+    }
+
+    // Async sync to Meta (non-blocking)
     if (meta_sync_client_ && !committed_records.empty()) {
-        meta_sync_client_->SyncCommit(store_id_, committed_records);
+        meta_sync_client_->AsyncCommit(store_id_, committed_records);
     }
 
     return results;
@@ -624,8 +674,8 @@ StoreGetResult FalconKVStore::Get(const std::string& key, void* buffer,
     result.size = record->size;
     result.status = Status::OK();
 
-    // 3. Update access time
-    meta_index_->Touch(key);
+    // Note: StoreMetaIndex::Get() already touches the LRU entry and updates
+    // access_time_ms, so no explicit Touch() call is needed here.
 
     return result;
 }
@@ -693,6 +743,18 @@ void FalconKVStore::Close() {
     evict_manager_.reset();
     pending_evict_queue_.reset();
 
+    // Close io_uring first, then stop thread pool.
+    if (io_uring_engine_) {
+        io_uring_engine_->Close();
+        io_uring_engine_.reset();
+    }
+    io_uring_enabled_ = false;
+
+    if (io_pool_) {
+        io_pool_->Stop();
+        io_pool_.reset();
+    }
+
     scheduler_proxy_.reset();
     if (meta_sync_client_) {
         meta_sync_client_->StopReconnectLoop();
@@ -702,8 +764,13 @@ void FalconKVStore::Close() {
     allocator_.reset();
     buffer_pool_.reset();
 
+    if (data_fd_buffered_ >= 0) {
+        fsync(data_fd_buffered_);
+        close(data_fd_buffered_);
+        data_fd_buffered_ = -1;
+    }
+
     if (data_fd_ >= 0) {
-        fsync(data_fd_);
         close(data_fd_);
         data_fd_ = -1;
     }

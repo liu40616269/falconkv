@@ -38,6 +38,7 @@ protected:
         config.node_id = 1;
         config.capacity_bytes = 16 * 1024 * 1024; // 16 MB
         config.page_size = 4096;
+        config.slot_size_bytes = 4096;  // 4KB slots match test data sizes
         config.disable_mtime = true;
         config.scheduler_enabled = false;
         return config;

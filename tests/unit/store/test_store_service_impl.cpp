@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <brpc/controller.h>
+
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -23,6 +25,7 @@ protected:
         config.store_id = 1;
         config.capacity_bytes = 16 * 1024 * 1024; // 16MB for testing
         config.page_size = 512;
+        config.slot_size_bytes = 4096;  // match test data sizes
 
         store_ = std::make_unique<FalconKVStore>(config);
         Status s = store_->Init();
@@ -41,18 +44,6 @@ protected:
     std::filesystem::path test_dir_;
     std::unique_ptr<FalconKVStore> store_;
     std::unique_ptr<StoreServiceImpl> service_;
-};
-
-// A trivial controller/closure pair for testing without brpc::Controller
-class TestController : public ::google::protobuf::RpcController {
-public:
-    void Reset() override {}
-    bool Failed() const override { return false; }
-    std::string ErrorText() const override { return ""; }
-    void StartCancel() override {}
-    void SetFailed(const std::string&) override {}
-    bool IsCanceled() const override { return false; }
-    void NotifyOnCancel(::google::protobuf::Closure*) override {}
 };
 
 class TestDone : public ::google::protobuf::Closure {
@@ -74,7 +65,7 @@ TEST_F(StoreServiceImplTest, PutThenReadByKey) {
     req.set_key("key1");
 
     GetByKeyResponse resp;
-    TestController cntl;
+    brpc::Controller cntl;
     TestDone done;
     service_->GetByKey(&cntl, &req, &resp, &done);
     EXPECT_EQ(0, resp.status());
@@ -87,7 +78,7 @@ TEST_F(StoreServiceImplTest, Ping) {
     ping_req.set_timestamp_ns(12345);
 
     PongResponse pong_resp;
-    TestController cntl;
+    brpc::Controller cntl;
     TestDone done;
 
     service_->Ping(&cntl, &ping_req, &pong_resp, &done);
@@ -107,11 +98,15 @@ TEST_F(StoreServiceImplTest, ReadOffsetBased) {
     req.set_size(data.size());
 
     ReadResponse resp;
-    TestController cntl;
+    brpc::Controller cntl;
     TestDone done;
     service_->Read(&cntl, &req, &resp, &done);
     EXPECT_EQ(0, resp.status());
-    EXPECT_EQ(data, resp.data());
+    // Data is in brpc attachment, not protobuf field
+    ASSERT_EQ(cntl.response_attachment().size(), data.size());
+    std::string got(cntl.response_attachment().size(), '\0');
+    cntl.response_attachment().copy_to(&got[0], got.size());
+    EXPECT_EQ(data, got);
 }
 
 TEST_F(StoreServiceImplTest, BatchGetByKey) {
@@ -128,7 +123,7 @@ TEST_F(StoreServiceImplTest, BatchGetByKey) {
     req.add_keys("key3"); // nonexistent
 
     BatchGetByKeyResponse resp;
-    TestController cntl;
+    brpc::Controller cntl;
     TestDone done;
     service_->BatchGetByKey(&cntl, &req, &resp, &done);
     EXPECT_EQ(1, resp.status()); // not all ok due to key3

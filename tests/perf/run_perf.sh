@@ -209,10 +209,10 @@ META_CONFIG="${META_CONFIG_DIR}/meta_config.json"
 cat > "${META_CONFIG}" <<EOF
 {
   "common": {
+    "meta_addr": "0.0.0.0:${META_PORT}",
     "log_dir": "${result_dir}/logs"
   },
   "meta": {
-    "listen_addr": "0.0.0.0:${META_PORT}",
     "shard_count": ${meta_shard_count}
   }
 }

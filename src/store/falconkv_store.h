@@ -6,6 +6,7 @@
 #include <mutex>
 #include <atomic>
 #include <functional>
+#include <memory>
 
 #include "src/common/status.h"
 #include "src/common/aligned_allocator.h"
@@ -34,11 +35,13 @@ struct WriteTask {
 
 struct StoreKeyRecord;
 class AlignedBufferPool;
-class BuddyAllocator;
+class SlotAllocator;
 class StoreMetaIndex;
 class MetaSyncClient;
 class PendingEvictQueue;
 class EvictManager;
+class IOThreadPool;
+class IOUringEngine;
 
 struct StorePutResult {
     Status status;
@@ -75,6 +78,10 @@ public:
         double evict_high_watermark = 0.85;
         double evict_low_watermark = 0.70;
         uint64_t evict_cold_threshold_ms = 300000;
+        bool io_uring_enabled = true;
+        bool direct_io_enabled = true;
+        uint32_t io_uring_queue_depth = 128;
+        uint32_t slot_size_bytes = 0;  // 0 = auto-detect from first write
 
         static Config FromStoreConfig(const StoreConfig& sc);
     };
@@ -112,19 +119,20 @@ public:
 
 private:
     Status InitDataFile();
-    void* AllocateAlignedBuffer(uint32_t size);
-    void FreeAlignedBuffer(void* buf);
 
     Config config_;
-    int data_fd_ = -1;
+    int data_fd_ = -1;            // O_DIRECT fd (when direct_io_enabled=true)
+    int data_fd_buffered_ = -1;   // Buffered fd (always open, no O_DIRECT)
     uint32_t store_id_;
     std::string data_file_;
-    std::vector<std::thread> io_workers_;
     std::atomic<bool> running_{false};
     std::unique_ptr<AlignedBufferPool> buffer_pool_;
+    std::unique_ptr<IOThreadPool> io_pool_;
+    std::unique_ptr<IOUringEngine> io_uring_engine_;
+    bool io_uring_enabled_ = false;
 
     // New: space management + local metadata + meta sync
-    std::unique_ptr<BuddyAllocator> allocator_;
+    std::unique_ptr<SlotAllocator> allocator_;
     std::unique_ptr<StoreMetaIndex> meta_index_;
     std::unique_ptr<MetaSyncClient> meta_sync_client_;
     std::unique_ptr<PendingEvictQueue> pending_evict_queue_;

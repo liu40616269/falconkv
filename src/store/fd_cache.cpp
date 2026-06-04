@@ -3,7 +3,8 @@
 #include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
-#include <system_error>
+
+#include "src/common/logging.h"
 
 namespace falconkv {
 
@@ -11,36 +12,56 @@ FdCache::~FdCache() {
     CloseAll();
 }
 
-int FdCache::GetFd(const std::string& data_file) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
+FdCache::FdEntry& FdCache::GetOrCreate(const std::string& data_file) {
     auto it = fd_map_.find(data_file);
     if (it != fd_map_.end()) {
-        // Update last access time
         auto now = std::chrono::steady_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch()).count();
         it->second.last_access_ms = static_cast<uint64_t>(ms);
-        return it->second.fd;
+        return it->second;
     }
 
-    // Open file with O_DIRECT | O_RDWR
-    int fd = ::open(data_file.c_str(), O_DIRECT | O_RDWR, 0644);
-    if (fd < 0) {
-        // If O_DIRECT fails (e.g., filesystem does not support it),
-        // fall back to O_RDWR only
-        fd = ::open(data_file.c_str(), O_RDWR, 0644);
-        if (fd < 0) {
-            return -1;
-        }
+    // Open buffered fd first (always succeeds or fails together).
+    int buf_fd = ::open(data_file.c_str(), O_RDWR, 0644);
+    if (buf_fd < 0) {
+        // Insert an entry with both fds invalid to avoid retrying.
+        auto now = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+        auto [ins_it, _] = fd_map_.emplace(data_file,
+            FdEntry{-1, -1, static_cast<uint64_t>(ms)});
+        return ins_it->second;
+    }
+
+    // Try to open O_DIRECT fd.
+    int direct_fd = ::open(data_file.c_str(), O_DIRECT | O_RDWR, 0644);
+    if (direct_fd < 0) {
+        LOG(INFO) << "[FdCache] O_DIRECT not available for " << data_file
+                  << ", using buffered only";
+        direct_fd = -1;
     }
 
     auto now = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()).count();
 
-    fd_map_.emplace(data_file, FdEntry{fd, static_cast<uint64_t>(ms)});
-    return fd;
+    auto [ins_it, _] = fd_map_.emplace(data_file,
+        FdEntry{direct_fd, buf_fd, static_cast<uint64_t>(ms)});
+    return ins_it->second;
+}
+
+int FdCache::GetFd(const std::string& data_file) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    FdEntry& entry = GetOrCreate(data_file);
+    // Prefer O_DIRECT fd; fall back to buffered fd.
+    return (entry.direct_fd >= 0) ? entry.direct_fd : entry.buffered_fd;
+}
+
+int FdCache::GetBufferedFd(const std::string& data_file) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    FdEntry& entry = GetOrCreate(data_file);
+    return entry.buffered_fd;
 }
 
 void FdCache::EvictIdle(size_t idle_threshold_ms) {
@@ -54,7 +75,12 @@ void FdCache::EvictIdle(size_t idle_threshold_ms) {
     while (it != fd_map_.end()) {
         uint64_t elapsed = static_cast<uint64_t>(now_ms) - it->second.last_access_ms;
         if (elapsed > idle_threshold_ms) {
-            ::close(it->second.fd);
+            if (it->second.direct_fd >= 0) {
+                ::close(it->second.direct_fd);
+            }
+            if (it->second.buffered_fd >= 0) {
+                ::close(it->second.buffered_fd);
+            }
             it = fd_map_.erase(it);
         } else {
             ++it;
@@ -65,7 +91,12 @@ void FdCache::EvictIdle(size_t idle_threshold_ms) {
 void FdCache::CloseAll() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [path, entry] : fd_map_) {
-        ::close(entry.fd);
+        if (entry.direct_fd >= 0) {
+            ::close(entry.direct_fd);
+        }
+        if (entry.buffered_fd >= 0) {
+            ::close(entry.buffered_fd);
+        }
     }
     fd_map_.clear();
 }

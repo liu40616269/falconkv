@@ -101,7 +101,7 @@
 
 ### 3.1 单元测试
 
-#### 3.1.1 BuddyAllocator (`tests/unit/meta/test_buddy_allocator.cpp`)
+#### 3.1.1 SlotAllocator (`tests/unit/meta/test_slot_allocator.cpp`)
 
 | 编号 | 测试项 | 前置条件 | 测试步骤 | 预期结果 |
 |------|--------|----------|----------|----------|
@@ -109,7 +109,7 @@
 | UT-M-002 | 分配页面对齐 | - | `AllocChunk()` | offset 按 page_size 对齐 |
 | UT-M-003 | 分配耗尽 | 所有空间已分配 | `AllocChunk()` | 返回 -1（ENOSPC） |
 | UT-M-004 | 释放后可重新分配 | 分配后释放 | `FreeChunk` → `AllocChunk` | 重新分配成功 |
-| UT-M-005 | 释放 buddy 合并 | 分配两个相邻 chunk | 释放两个 chunk | buddy 合并成功 |
+| UT-M-005 | 释放后可重分配 | 分配两个 slot | 释放两个 slot | 重分配成功 |
 | UT-M-006 | 使用率计算 | 1GB 总量，分配 512MB | `GetUsageRatio()` | 返回 0.5 |
 | UT-M-007 | 反复分配释放无泄漏 | 初始化 1GB | 循环 Alloc+Free 10000 次 | used_pages 最终归零 |
 | UT-M-008 | 全部分配释放后使用率为零 | 分配全部后释放 | `GetUsageRatio()` | 返回 0.0 |
@@ -580,47 +580,35 @@ Client 配置 `scheduler_enabled=true`，Client 内部的 SchedulerProxy 通过 
 - **ACCESS_NODE_DIRECT**：同节点不同 Store 之间的 DirectIO 直读
 - **ACCESS_REMOTE_RPC**：跨节点 Store RPC 远程读取
 
-### 10.2 配置设计
+测试拆分为三个**独立用例**，每个用例验证一种读取路径，可单独运行、互不干扰：
 
-统一配置文件 `perf_config.json`，包含五段：
+| 用例 | 脚本 | 配置文件 | 参与客户端 | 验证路径 |
+|------|------|----------|-----------|----------|
+| 本地读写 | `run_perf_local.sh` | `perf_config_local.json` | A (writer) | ACCESS_LOCAL_DIRECT |
+| 本节点读 | `run_perf_node_read.sh` | `perf_config_node_read.json` | A (writer) + B (same_node_reader) | ACCESS_NODE_DIRECT |
+| 跨节点读 | `run_perf_cross_node.sh` | `perf_config_cross_node.json` | A (writer) + C (cross_node_reader) | ACCESS_REMOTE_RPC |
+
+三个用例共享 `perf_common.sh`（公共函数库）和 `perf_client.py` / `perf_aggregate.py`（工作进程和结果汇总）。
+
+### 10.2 公共配置结构
+
+每个配置文件包含五段：
 
 ```json
 {
   "test": {
-    "duration_sec": 30,
-    "batch_size": 8,
-    "value_size": 4096,
-    "shared_key_ratio": 0.3,
-    "warmup_sec": 3,
+    "duration_sec": 20,
+    "batch_size": 64,
+    "value_size": 1048576,
+    "warmup_sec": 5,
     "meta_listen_port": 18900,
-    "scheduler_uds_path": "/tmp/falconkv_perf_sched.sock",
-    "result_dir": "/tmp/falconkv_perf_result"
+    "scheduler_uds_path": "...",
+    "result_dir": "..."
   },
-  "meta": {
-    "shard_count": 16
-  },
-  "scheduler": {
-    "schedule_policy": "passthrough",
-    "enabled": false
-  },
-  "clients": [
-    {
-      "client_id": "A",
-      "node_id": 1,
-      "store_id": 1,
-      "listen_port": 18901,
-      "ssd_path": "/tmp/falconkv_perf_ssd/A",
-      "capacity_gb": 1,
-      "cache_capacity": 100000,
-      "io_threads": 2,
-      "buffer_pool_size": 4,
-      "store_rpc_host": "127.0.0.1"
-    },
-    ...
-  ],
-  "transfer": {
-    "meta_addr": "127.0.0.1:18900"
-  }
+  "meta": { "shard_count": 16 },
+  "scheduler": { "schedule_policy": "passthrough", "enabled": true },
+  "clients": [ ... ],
+  "transfer": { "meta_addr": "127.0.0.1:18900" }
 }
 ```
 
@@ -628,37 +616,137 @@ Client 配置 `scheduler_enabled=true`，Client 内部的 SchedulerProxy 通过 
 
 | 段 | 用途 |
 |----|------|
-| `test` | 测试参数：持续时间、批量大小、值大小、共享 key 比例、预热时长 |
+| `test` | 测试参数：持续时间、批量大小、值大小、预热时长 |
 | `meta` | Meta 服务配置 |
-| `scheduler` | Scheduler 配置（默认 disabled） |
+| `scheduler` | Scheduler 配置 |
 | `clients` | 每个 Client 定义：client_id, node_id, store_id, listen_port, ssd_path, capacity_gb 等 |
 | `transfer` | 传输层配置 |
 
-### 10.3 测试流程
+### 10.3 测试用例详细设计
 
-每个 `perf_client.py` 进程执行以下流程：
+#### 10.3.1 用例一：本地读写（PERF-LOCAL）
 
-**Warmup 阶段**：
-- 写入一批预热数据，让 Meta 同步完成
-- 等待 `warmup_sec` 秒确保所有 Client 的数据在 Meta 可见
+**目标**：验证 Client A 写入自身 Store 后，通过 `ACCESS_LOCAL_DIRECT` 进程内读取的延迟和吞吐量。
 
-**主测试阶段**（循环 `duration_sec` 秒）：
-1. 生成一批 key（`batch_size` 个）
-2. `batch_exist` 检查 key 存在性，记录延迟
-3. `batch_put` 写入数据，记录延迟
-4. `batch_get` 读回数据，记录延迟
+**配置文件**：`perf_config_local.json`
 
-**Key 策略**：
-- `shared_key_ratio`（默认 0.3）控制共享 key 比例
-- 30% 共享 key（`perf_shared_{i}` 前缀）→ 跨 Client 可见，触发跨 Store/跨节点读取
-- 70% 独占 key（`perf_{client_id}_{i}` 前缀）→ 仅自身可见
+**客户端定义**：
 
-**共享 key 路径**：
-- Client A 写入 `perf_shared_*` → Store 1 (node 1)
-- Client B（同 node）读取走 `ACCESS_NODE_DIRECT`
-- Client C（不同 node）读取走 `ACCESS_REMOTE_RPC`
+| Client | node_id | store_id | 角色 |
+|--------|---------|----------|------|
+| A | 1 | 1 | writer（写入 + 本地读回） |
 
-### 10.4 采集指标
+**数据路径**：`Client A → batch_put → Store 1 (SSD DirectIO) → batch_get → 进程内读取`
+
+**测试流程**：
+
+1. **Warmup 阶段**（`warmup_sec` 秒）：Client A 持续写入 `warmup_A_{batch}_{i}` 前缀的 key，预热 Store 和 Meta。
+2. **Benchmark 阶段**（`duration_sec` 秒），每轮循环：
+   - 生成 `bench_A_{batch}_{i}` 前缀的 write keys
+   - `batch_exist` 检查 key 存在性，记录延迟
+   - `batch_put` 写入新 key，记录延迟
+   - `batch_get` 读取上一轮写入的 key（`bench_A_{batch-1}_{i}`），记录延迟
+3. 输出 `result_A.json`
+
+**验证要点**：
+
+- put 延迟反映本地 SSD DirectIO 写入性能
+- get 延迟反映进程内直接读取性能（无 RPC、无跨进程通信）
+- exist 延迟反映 KeyDescCache + Meta RPC 查询性能
+
+#### 10.3.2 用例二：本节点读（PERF-NODE-READ）
+
+**目标**：验证 Client B 通过 `ACCESS_NODE_DIRECT`（NodeLocalAccessor DirectIO）读取同节点 Client A 写入的数据的延迟和吞吐量。
+
+**配置文件**：`perf_config_node_read.json`
+
+**客户端定义**：
+
+| Client | node_id | store_id | 角色 |
+|--------|---------|----------|------|
+| A | 1 | 1 | writer（写入数据供 B 读取） |
+| B | 1 | 2 | same_node_reader（同节点 DirectIO 直读） |
+
+**数据路径**：
+- 写入：`Client A → batch_put → Store 1 (SSD)`
+- 读取：`Client B → batch_exist → Meta 查询 → KeyDescriptor(access_type=ACCESS_NODE_DIRECT) → NodeLocalAccessor → DirectIO → Store 1 文件`
+
+**测试流程**：
+
+1. **Warmup 阶段**：Client A 写入 `warmup_A_{batch}_{i}` 数据，Client B 等待 A 完成后通过 marker 文件获取 warmup batch 数量。
+2. **等待 Meta 同步**：2 秒等待 Meta 数据传播。
+3. **Benchmark 阶段**（`duration_sec` 秒），每轮循环：
+   - Client A：同用例一（写入新 key + 读回自身旧 key）
+   - Client B：
+     - 生成 `warmup_A_{batch % warmup_batch_count}_{i}` 前缀的 read keys（循环读取 A 的 warmup 数据）
+     - `batch_exist` 检查 key 存在性
+     - `batch_get` 通过 NodeLocalAccessor DirectIO 读取 A 的 Store 文件
+4. 输出 `result_A.json`、`result_B.json`
+
+**验证要点**：
+
+- Client B 的 get 延迟反映同节点 DirectIO 直读性能（绕过 RPC）
+- 对比用例一的 get 延迟，NodeDirect 应高于 LocalDirect（多了 fd cache lookup 和 DirectIO pread）
+- Client A 和 Client B 并行运行，验证并发 IO 场景下性能稳定
+
+#### 10.3.3 用例三：跨节点读（PERF-CROSS-NODE）
+
+**目标**：验证 Client C 通过 `ACCESS_REMOTE_RPC`（StoreRpcClient）读取不同节点 Client A 写入的数据的延迟和吞吐量。
+
+**配置文件**：`perf_config_cross_node.json`
+
+**客户端定义**：
+
+| Client | node_id | store_id | 角色 |
+|--------|---------|----------|------|
+| A | 1 | 1 | writer（写入数据供 C 读取） |
+| C | 2 | 3 | cross_node_reader（跨节点 RPC 读取） |
+
+**数据路径**：
+- 写入：`Client A → batch_put → Store 1 (node 1, SSD)`
+- 读取：`Client C → batch_exist → Meta 查询 → KeyDescriptor(access_type=ACCESS_REMOTE_RPC) → StoreRpcClient → brpc → Store 1 RPC Service → SSD`
+
+**测试流程**：
+
+1. **Warmup 阶段**：同用例二，Client A 写入数据，Client C 等待。
+2. **等待 Meta 同步**：2 秒等待。
+3. **Benchmark 阶段**（`duration_sec` 秒），每轮循环：
+   - Client A：同用例一
+   - Client C：
+     - 循环读取 `warmup_A_*` 数据
+     - `batch_exist` + `batch_get` 通过 RPC 跨节点读取
+4. 输出 `result_A.json`、`result_C.json`
+
+**验证要点**：
+
+- Client C 的 get 延迟反映跨节点 RPC 读取性能（包含 brpc 序列化 + 网络传输 + 远端 Store DirectIO）
+- 对比用例一和用例二的 get 延迟，CrossNode 应最高（增加网络往返开销）
+- 验证跨节点场景下 Meta 同步和 KeyDescriptor 路由的正确性
+
+### 10.4 客户端角色自动判定
+
+`perf_client.py` 根据配置自动判定每个客户端的角色：
+
+```python
+def _get_role(client_id, client_cfg, config):
+    if client_id == "A":
+        return "writer"
+    writer_cfg = _find_client_config(config, "A")
+    if client_cfg["node_id"] == writer_cfg["node_id"]:
+        return "same_node_reader"
+    return "cross_node_reader"
+```
+
+- Client A 始终为 writer：warmup 写入 + benchmark 写入新 key + 读回自身旧 key
+- 其他 Client 根据与 A 的 `node_id` 关系判定为 `same_node_reader` 或 `cross_node_reader`，循环读取 A 的 warmup 数据
+
+**本地读写用例**（仅 Client A）：`perf_client.py` 以 writer 模式运行，只执行本地 put + get。
+
+**本节点读用例**（Client A + B）：B 的 `node_id` 等于 A 的 `node_id`，自动判定为 `same_node_reader`。
+
+**跨节点读用例**（Client A + C）：C 的 `node_id` 不等于 A 的 `node_id`，自动判定为 `cross_node_reader`。
+
+### 10.5 采集指标
 
 每操作类型（exist / put / get）采集：
 
@@ -671,36 +759,61 @@ Client 配置 `scheduler_enabled=true`，Client 内部的 SchedulerProxy 通过 
 | `throughput_mb` | 吞吐量 (MB/s) |
 | `errors` | 错误次数 |
 
-### 10.5 结果汇总
+### 10.6 结果汇总
 
 `perf_aggregate.py` 读取各 Client 的 `result_{client_id}.json`，打印汇总表格：
 
 ```
-==================== Performance Summary ====================
-Client | Op     | Total | Avg(ms) | P50(ms) | P99(ms) | Ops/s   | MB/s
--------|--------|-------|---------|---------|---------|---------|------
-A      | exist  |  1200 |   0.35  |   0.30  |   0.85  |   40.0  |  0.0
-A      | put    |  1200 |   1.20  |   1.10  |   3.50  |   40.0  |  0.2
-A      | get    |  1200 |   0.50  |   0.45  |   1.20  |   40.0  |  0.2
-B      | exist  |  1200 |   0.38  |   0.32  |   0.90  |   40.0  |  0.0
-...
+=== FalconKV Local Read/Write Test ===
+===================================================
+  Client | Role               | Op     | Total | Avg(ms) | P50(ms) | P99(ms) | Ops/s   | MB/s
+  -------------------------------------------------------------------------------------------------------------------
+  A(n1,s1)| writer             | exist  |   500 |   0.35  |   0.30  |   0.85  |   40.0  |  0.0
+  A(n1,s1)| writer             | put    |   480 |   1.20  |   1.10  |   3.50  |   40.0  |  0.2
+  A(n1,s1)| writer             | get    |   460 |   0.50  |   0.45  |   1.20  |   40.0  |  0.2
 ```
 
 同时输出 `summary.json` 供程序化分析。
 
-### 10.6 一键启动
+### 10.7 脚本架构
 
-`run_perf.sh` 一键启动脚本流程：
+公共函数库 `perf_common.sh` 提供：
 
-1. 解析 `perf_config.json`
-2. 创建必要的 SSD 和结果目录
-3. 启动 Meta → 等待端口就绪
-4. 启动 Scheduler → 等待 UDS 就绪
-5. 并行启动所有 `perf_client.py` 进程
-6. `wait` 等待所有 Client 完成
-7. 停止 Meta / Scheduler
-8. 调用 `perf_aggregate.py` 汇总
-9. `trap cleanup EXIT` 确保进程清理
+| 函数 | 说明 |
+|------|------|
+| `parse_config` | 解析 JSON 配置为 shell 变量 |
+| `wait_for_port` | 轮询等待 TCP 端口就绪 |
+| `wait_for_file` | 轮询等待文件出现 |
+| `stop_process` | SIGTERM → 超时 SIGKILL 停止进程 |
+| `run_perf` | 主入口：启动 Meta/Scheduler → 并行启动 Client → 等待完成 → 停止服务 → 汇总结果 |
+
+三个 wrapper 脚本各只需 source `perf_common.sh` 并调用 `run_perf`：
+
+```bash
+# run_perf_local.sh
+source perf_common.sh
+run_perf "$CONFIG_FILE" "FalconKV Local Read/Write Test"
+```
+
+### 10.8 一键启动
+
+```bash
+cd tests/perf
+
+# 用例一：本地读写（仅 Client A）
+./run_perf_local.sh
+
+# 用例二：本节点读（Client A + B）
+./run_perf_node_read.sh
+
+# 用例三：跨节点读（Client A + C）
+./run_perf_cross_node.sh
+
+# 仍可使用原综合脚本（Client A + B + C 全部运行）
+./run_perf.sh perf_config.json
+```
+
+每个脚本自动完成：解析配置 → 创建目录 → 启动 Meta → 启动 Scheduler（可选）→ 并行启动 Client → 等待完成 → 停止服务 → 结果汇总。`trap cleanup EXIT` 确保异常退出时进程被清理。
 
 ---
 
@@ -734,7 +847,7 @@ falconkv/
 │   │   │   ├── test_alloc_policy.cpp
 │   │   │   └── test_data_structures.cpp
 │   │   ├── meta/
-│   │   │   ├── test_buddy_allocator.cpp
+│   │   │   ├── test_slot_allocator.cpp
 │   │   │   ├── test_meta_sync_commit.cpp
 │   │   │   ├── test_meta_service_impl.cpp
 │   │   │   └── test_meta_rpc_client.cpp
@@ -776,10 +889,17 @@ falconkv/
 │       ├── test_scheduler_integration.py  # Scheduler 进程级集成
 │       └── test_evict_and_scheduler_e2e.py  # Store 驱逐 + Scheduler 统计集成测试
 │   └── perf/                            # 端到端性能测试
-│       ├── perf_config.json             # 性能测试配置
+│       ├── perf_common.sh               # 公共函数库（parse_config, run_perf 等）
 │       ├── perf_client.py               # 单 Client 工作进程
 │       ├── perf_aggregate.py            # 结果汇总脚本
-│       └── run_perf.sh                  # 一键启动脚本
+│       ├── perf_config.json             # 综合测试配置（A+B+C 全部运行）
+│       ├── run_perf.sh                  # 综合测试一键启动脚本
+│       ├── perf_config_local.json       # 用例一：本地读写配置（仅 Client A）
+│       ├── run_perf_local.sh            # 用例一：本地读写启动脚本
+│       ├── perf_config_node_read.json   # 用例二：本节点读配置（Client A + B）
+│       ├── run_perf_node_read.sh        # 用例二：本节点读启动脚本
+│       ├── perf_config_cross_node.json  # 用例三：跨节点读配置（Client A + C）
+│       └── run_perf_cross_node.sh       # 用例三：跨节点读启动脚本
 ```
 
 ### 12.2 测试依赖
@@ -821,8 +941,19 @@ pytest tests/integration/test_functional_e2e.py -v
 # 服务启动测试
 pytest tests/integration/test_e2e_batch_ops.py -v
 
-# 端到端性能测试（一键启动 Meta + Scheduler + 多 Client）
-chmod +x tests/perf/run_perf.sh
+# 端到端性能测试 — 三个独立用例
+chmod +x tests/perf/run_perf_*.sh tests/perf/perf_common.sh
+
+# 用例一：本地读写（ACCESS_LOCAL_DIRECT，仅 Client A）
+./tests/perf/run_perf_local.sh
+
+# 用例二：本节点读（ACCESS_NODE_DIRECT，Client A + B）
+./tests/perf/run_perf_node_read.sh
+
+# 用例三：跨节点读（ACCESS_REMOTE_RPC，Client A + C）
+./tests/perf/run_perf_cross_node.sh
+
+# 综合测试（Client A + B + C 全部运行）
 ./tests/perf/run_perf.sh tests/perf/perf_config.json
 ```
 
@@ -856,4 +987,4 @@ chmod +x tests/perf/run_perf.sh
 | falconkv_store_design.md | 第 4 节（Store 测试） |
 | falconkv_transfer_design.md | 第 5 节（Transfer 测试） |
 | falconkv_scheduler_design.md | 第 6 节（Scheduler 测试）+ 第 7 节（Bypass 测试） |
-| falconkv_design.md（全局） | 第 8 节（集成测试）+ 第 9 节（性能测试）+ 第 10 节（多节点性能测试）+ 第 11 节（边界测试） |
+| falconkv_design.md（全局） | 第 8 节（集成测试）+ 第 9 节（性能测试）+ 第 10 节（多节点性能测试：本地读写 / 本节点读 / 跨节点读）+ 第 11 节（边界测试） |

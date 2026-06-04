@@ -60,6 +60,14 @@ FalconKVClientImpl::FalconKVClientImpl(const Config& config)
 
     // Start background reconnect loop for Meta RPC client.
     meta_client_.StartReconnectLoop(5);
+
+    // Initialize NodeLocalAccessor IO engines for batch NODE_DIRECT reads
+    NodeLocalAccessor::Config nla_cfg;
+    nla_cfg.page_size = cfg.store.page_size;
+    nla_cfg.io_threads = cfg.store.io_threads;
+    nla_cfg.io_uring_enabled = cfg.store.io_uring_enabled;
+    nla_cfg.io_uring_queue_depth = cfg.store.io_uring_queue_depth;
+    node_accessor_.InitIOEngines(nla_cfg);
 }
 
 FalconKVClientImpl::~FalconKVClientImpl() {
@@ -271,7 +279,10 @@ std::vector<Status> FalconKVClientImpl::BatchPut(
     for (size_t i = 0; i < results.size(); ++i) {
         statuses[i] = results[i].status;
 
-        if (results[i].status.ok()) {
+        // Only update KeyDescCache when a real write happened (alloc_size > 0).
+        // When a key already exists, the store returns OK with offset=0,
+        // alloc_size=0 — updating the cache would overwrite the correct entry.
+        if (results[i].status.ok() && results[i].alloc_size > 0) {
             KeyDescriptor desc(keys[i]);
             desc.store_id = local_store_->store_id();
             desc.offset = results[i].offset;
@@ -299,61 +310,215 @@ std::vector<int32_t> FalconKVClientImpl::BatchGet(
 
     std::vector<int32_t> bytes_read(key_descs.size(), 0);
 
+    // Phase 1: Group LOCAL_DIRECT keys for batch read via local_store_
+    std::vector<size_t> local_indices;
+    std::vector<ReadItem> local_reads;
+
     for (size_t i = 0; i < key_descs.size(); ++i) {
         const auto& desc = key_descs[i];
-        const auto& buf = buffers[i];
+        if (desc.access_type == AccessType::ACCESS_LOCAL_DIRECT && local_store_) {
+            local_indices.push_back(i);
+            local_reads.push_back({desc.offset, buffers[i].data_ptr, buffers[i].size});
+        }
+    }
 
-        LOG(INFO) << "[BatchGet] key=" << desc.key
-                  << " store_id=" << desc.store_id
-                  << " offset=" << desc.offset
-                  << " size=" << desc.size
-                  << " access_type=" << static_cast<int>(desc.access_type);
+    // Execute batch read for all LOCAL_DIRECT keys in one call
+    if (!local_reads.empty()) {
+        uint64_t total_local_io = 0;
+        for (const auto& item : local_reads) {
+            total_local_io += item.size;
+        }
 
-        int channel = ChannelForAccessType(desc.access_type);
-        uint32_t store_id = desc.store_id;
-        std::string remote_addr = RemoteAddrForDesc(desc);
-
-        // Scheduler: RequestIO
+        // Scheduler: RequestIO for batch local read
         uint64_t request_ts = GetCurrentTimeNs();
         IOResponseData io_resp;
         if (scheduler_enabled_) {
             IORequestData io_req;
-            io_req.io_channel = channel;
-            io_req.store_id = store_id;
-            io_req.io_size = buf.size;
+            io_req.io_channel = 0;  // LOCAL_SSD_READ
+            io_req.store_id = local_store_->store_id();
+            io_req.io_size = total_local_io;
             io_req.request_ts_ns = request_ts;
-            io_req.remote_node_addr = remote_addr;
             io_resp = scheduler_proxy_->RequestIO(io_req);
         }
 
-        // Execute read
         uint64_t start_ts = GetCurrentTimeNs();
-        Status read_status = DoRead(desc, buf.data_ptr, buf.size);
+        Status batch_status = local_store_->BatchRead(local_reads);
         uint64_t done_ts = GetCurrentTimeNs();
 
-        if (!read_status.ok()) {
-            LOG(WARNING) << "[BatchGet] DoRead FAILED for key=" << desc.key
-                         << " status=" << read_status.ToString();
+        if (!batch_status.ok()) {
+            LOG(WARNING) << "[BatchGet] BatchRead FAILED status="
+                         << batch_status.ToString();
         }
 
-        // Scheduler: ReportIOCompletion
+        // Scheduler: ReportIOCompletion for batch
         if (scheduler_enabled_) {
             IOCompletionData report;
             report.ticket = io_resp.ticket;
             report.io_start_ts_ns = start_ts;
             report.io_done_ts_ns = done_ts;
-            report.io_size = buf.size;
-            report.io_channel = channel;
-            report.io_status = read_status.ok() ? 0 : -1;
-            report.store_id = store_id;
-            report.remote_node_addr = remote_addr;
+            report.io_size = total_local_io;
+            report.io_channel = 0;  // LOCAL_SSD_READ
+            report.io_status = batch_status.ok() ? 0 : -1;
+            report.store_id = local_store_->store_id();
             scheduler_proxy_->ReportIOCompletion(report);
         }
 
-        if (read_status.ok()) {
-            bytes_read[i] = static_cast<int32_t>(buf.size);
+        // Mark results for LOCAL_DIRECT keys
+        if (batch_status.ok()) {
+            for (size_t idx : local_indices) {
+                bytes_read[idx] = static_cast<int32_t>(buffers[idx].size);
+            }
         } else {
-            bytes_read[i] = -1;
+            for (size_t idx : local_indices) {
+                bytes_read[idx] = -1;
+            }
+        }
+    }
+
+    // Phase 2a: Batch NODE_DIRECT reads via NodeLocalAccessor::BatchRead
+    {
+        std::vector<size_t> node_indices;
+        std::vector<NodeLocalReadRequest> node_requests;
+        uint64_t total_node_io = 0;
+
+        for (size_t i = 0; i < key_descs.size(); ++i) {
+            const auto& desc = key_descs[i];
+            if (desc.access_type == AccessType::ACCESS_NODE_DIRECT) {
+                node_indices.push_back(i);
+                node_requests.push_back({desc.store_id, desc.offset,
+                                         buffers[i].data_ptr, buffers[i].size});
+                total_node_io += buffers[i].size;
+            }
+        }
+
+        if (!node_requests.empty()) {
+            // Scheduler: RequestIO for batch node-direct read
+            uint64_t request_ts = GetCurrentTimeNs();
+            IOResponseData io_resp;
+            if (scheduler_enabled_) {
+                IORequestData io_req;
+                io_req.io_channel = 0;  // LOCAL_SSD_READ
+                io_req.io_size = total_node_io;
+                io_req.request_ts_ns = request_ts;
+                io_resp = scheduler_proxy_->RequestIO(io_req);
+            }
+
+            uint64_t start_ts = GetCurrentTimeNs();
+            auto batch_results = node_accessor_.BatchRead(node_requests);
+            uint64_t done_ts = GetCurrentTimeNs();
+
+            // Scheduler: ReportIOCompletion for batch
+            if (scheduler_enabled_) {
+                IOCompletionData report;
+                report.ticket = io_resp.ticket;
+                report.io_start_ts_ns = start_ts;
+                report.io_done_ts_ns = done_ts;
+                report.io_size = total_node_io;
+                report.io_channel = 0;  // LOCAL_SSD_READ
+                bool all_ok = true;
+                for (const auto& s : batch_results) {
+                    if (!s.ok()) { all_ok = false; break; }
+                }
+                report.io_status = all_ok ? 0 : -1;
+                scheduler_proxy_->ReportIOCompletion(report);
+            }
+
+            // Map results back
+            for (size_t j = 0; j < node_indices.size(); ++j) {
+                size_t idx = node_indices[j];
+                if (batch_results[j].ok()) {
+                    bytes_read[idx] = static_cast<int32_t>(buffers[idx].size);
+                } else {
+                    LOG(WARNING) << "[BatchGet] NodeLocalAccessor::BatchRead FAILED for key="
+                                 << key_descs[idx].key
+                                 << " status=" << batch_results[j].ToString();
+                    bytes_read[idx] = -1;
+                }
+            }
+        }
+    }
+
+    // Phase 2b: Batch REMOTE_RPC reads — group by store_id, one BatchRead RPC per store
+    {
+        std::unordered_map<uint32_t, std::vector<size_t>> rpc_groups;
+        for (size_t i = 0; i < key_descs.size(); ++i) {
+            if (key_descs[i].access_type == AccessType::ACCESS_REMOTE_RPC) {
+                rpc_groups[key_descs[i].store_id].push_back(i);
+            }
+        }
+
+        for (auto& [sid, indices] : rpc_groups) {
+            StoreRpcClient* rpc = GetStoreRpcClient(sid);
+            if (!rpc) {
+                LOG(ERROR) << "[BatchGet] No RPC client for store " << sid
+                           << ", failing " << indices.size() << " keys";
+                for (size_t idx : indices) {
+                    bytes_read[idx] = -1;
+                }
+                continue;
+            }
+
+            size_t n = indices.size();
+            std::vector<uint64_t> offsets(n);
+            std::vector<uint32_t> seg_sizes(n);
+            std::vector<void*> seg_bufs(n);
+            uint64_t total_rpc_io = 0;
+
+            for (size_t j = 0; j < n; ++j) {
+                size_t idx = indices[j];
+                offsets[j] = key_descs[idx].offset;
+                seg_sizes[j] = buffers[idx].size;
+                seg_bufs[j] = buffers[idx].data_ptr;
+                total_rpc_io += buffers[idx].size;
+            }
+
+            // Scheduler: RequestIO for batch RPC read
+            uint64_t request_ts = GetCurrentTimeNs();
+            IOResponseData io_resp;
+            std::string remote_addr = RemoteAddrForDesc(key_descs[indices[0]]);
+            if (scheduler_enabled_) {
+                IORequestData io_req;
+                io_req.io_channel = 2;  // NET_TX_READ
+                io_req.store_id = sid;
+                io_req.io_size = total_rpc_io;
+                io_req.request_ts_ns = request_ts;
+                io_req.remote_node_addr = remote_addr;
+                io_resp = scheduler_proxy_->RequestIO(io_req);
+            }
+
+            uint64_t start_ts = GetCurrentTimeNs();
+            std::vector<int32_t> rpc_results;
+            Status batch_status = rpc->BatchRead(offsets, seg_sizes, seg_bufs, rpc_results);
+            uint64_t done_ts = GetCurrentTimeNs();
+
+            if (!batch_status.ok()) {
+                LOG(WARNING) << "[BatchGet] BatchRead RPC FAILED for store " << sid
+                             << " (" << n << " keys): " << batch_status.ToString();
+            }
+
+            // Scheduler: ReportIOCompletion for batch
+            if (scheduler_enabled_) {
+                IOCompletionData report;
+                report.ticket = io_resp.ticket;
+                report.io_start_ts_ns = start_ts;
+                report.io_done_ts_ns = done_ts;
+                report.io_size = total_rpc_io;
+                report.io_channel = 2;  // NET_TX_READ
+                report.io_status = batch_status.ok() ? 0 : -1;
+                report.store_id = sid;
+                report.remote_node_addr = remote_addr;
+                scheduler_proxy_->ReportIOCompletion(report);
+            }
+
+            // Map results back
+            for (size_t j = 0; j < n; ++j) {
+                size_t idx = indices[j];
+                if (j < rpc_results.size() && rpc_results[j] > 0) {
+                    bytes_read[idx] = rpc_results[j];
+                } else {
+                    bytes_read[idx] = -1;
+                }
+            }
         }
     }
 

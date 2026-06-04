@@ -21,7 +21,7 @@ Data flow:
 ./build.sh clean                              # Clean build directory
 
 # Run a specific test
-cd build && ctest --output-on-failure -R test_buddy_allocator
+cd build && ctest --output-on-failure -R test_slot_allocator
 
 # Manual build
 mkdir -p build && cd build
@@ -38,7 +38,7 @@ Build outputs go to `build/`. GTest is auto-fetched via FetchContent if not inst
 ```
 src/
 ├── client/     Client API: FalconKVClientImpl with batch Exist/Put/Get (binds to local_store_)
-├── common/     Status codes, config loader (FalconKVConfig), aligned allocator, BuddyAllocator, logging
+├── common/     Status codes, config loader (FalconKVConfig), aligned allocator, SlotAllocator, logging
 ├── meta/       Metadata aggregation service: MetaManager, sharded in-memory store with per-shard read-write locks, standalone `falconkv_master` process
 ├── store/      SSD storage: FalconKVStore with DirectIO, StoreMetaIndex, MetaSyncClient, EvictManager
 ├── transfer/   RPC layer: TransferManager, TransferChannel (abstract), BrpcChannel
@@ -49,7 +49,7 @@ src/
 
 **BatchExist** (two-step query, no cache): Client queries `local_store_->BatchContains()` → Client queries Meta via `BatchExist` RPC for missing keys. KeyDescCache is NOT queried during BatchExist (to avoid stale entries from evicted data), but Meta results are cached for subsequent BatchGet.
 
-**BatchPut** (local store write): Client calls `local_store_->BatchPut()` which internally allocates space via BuddyAllocator, writes data via DirectIO, records metadata in StoreMetaIndex, and asynchronously syncs to Meta via MetaSyncClient. Client is not aware of offset or space allocation.
+**BatchPut** (local store write): Client calls `local_store_->BatchPut()` which internally allocates space via SlotAllocator, writes data via DirectIO, records metadata in StoreMetaIndex, and asynchronously syncs to Meta via MetaSyncClient. Client is not aware of offset or space allocation.
 
 **BatchGet** (three-level read affinity): Client uses cached `KeyDescriptor`s → reads data based on `AccessType`: local store in-process (Level 0), NodeLocalAccessor DirectIO for same-node stores (Level 1), or StoreRpcClient for remote stores (Level 2).
 
@@ -66,7 +66,7 @@ Writes always go to the bound local store (`ACCESS_LOCAL_DIRECT`). The three-lev
 ### Store Self-Management
 
 Each Store manages its own space and eviction:
-- **BuddyAllocator** (`src/common/buddy_allocator.h`): Allocates/frees SSD space in fixed-size chunks
+- **SlotAllocator** (`src/common/slot_allocator.h`): Allocates/frees SSD space in fixed-size chunks
 - **StoreMetaIndex** (`src/store/store_meta_index.h`): Local key→offset hash index for fast lookups
 - **MetaSyncClient** (`src/store/meta_sync_client.h`): Syncs metadata changes (SyncCommit/SyncRemove) to Meta with automatic reconnection and full resync on reconnect
 - **MetaRpcClient** (`src/meta/meta_rpc_client.h`): Client-side Meta RPC wrapper with disconnect tolerance — returns empty results when Meta is unreachable, auto-reconnects in background
@@ -111,5 +111,5 @@ Single JSON config file (`config/falconkv.json`) loaded by `ConfigLoader`. Top-l
 - `Status` (`src/common/status.h`): Error codes — kOk, kIOError, kNotFound, kRpcError, kTimeout, kNoSpace, etc.
 - `KeyDescriptor` (`src/client/key_desc_cache.h`): key metadata for cached lookups (store_id, offset, size, access_type)
 - `StoreKeyRecord` (`src/store/store_meta_index.h`): Store-internal key record (offset, size, stat, access_time)
-- `BuddyAllocator` (`src/common/buddy_allocator.h`): SSD space management for fixed-size chunks
+- `SlotAllocator` (`src/common/slot_allocator.h`): SSD space management for fixed-size chunks
 - `FalconKVConfig` (`src/common/config.h`): aggregated config from all modules

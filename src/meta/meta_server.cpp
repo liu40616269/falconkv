@@ -4,9 +4,10 @@
 
 namespace falconkv {
 
-MetaServer::MetaServer(const MetaConfig& config)
+MetaServer::MetaServer(const MetaConfig& config,
+                       const std::string& meta_addr)
     : config_(config),
-      listen_addr_(config.listen_addr),
+      listen_addr_(meta_addr),
       service_impl_(&meta_manager_) {}
 
 MetaServer::~MetaServer() {

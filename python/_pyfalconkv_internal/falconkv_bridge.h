@@ -29,6 +29,7 @@ public:
     struct Config {
         std::string config_file;         // FalconKV 配置文件路径
         size_t cache_capacity = 100000;  // Key 描述缓存容量
+        int worker_id = -1;  // -1 表示未设置；>= 0 时自动计算 store_id
     };
 
     explicit FalconKVBridge(const Config& config);

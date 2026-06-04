@@ -64,7 +64,6 @@ void ApplyEnvOverrides(FalconKVConfig& config) {
     config.scheduler.reconnect_interval_sec = config.common.reconnect_interval_sec;
 
     // Meta config overrides
-    config.meta.listen_addr = GetEnvOrDefault("FALCONKV_META_LISTEN_ADDR", config.meta.listen_addr);
     config.meta.shard_count = GetEnvOrDefaultInt("FALCONKV_SHARD_COUNT", config.meta.shard_count);
     config.meta.page_size = GetEnvOrDefaultUInt("FALCONKV_PAGE_SIZE", config.meta.page_size);
     config.meta.heartbeat_timeout_sec = GetEnvOrDefaultInt("FALCONKV_HEARTBEAT_TIMEOUT_SEC", config.meta.heartbeat_timeout_sec);
@@ -78,12 +77,15 @@ void ApplyEnvOverrides(FalconKVConfig& config) {
     config.store.alignment = GetEnvOrDefaultUInt("FALCONKV_ALIGNMENT", config.store.alignment);
     config.store.listen_port = GetEnvOrDefaultUInt("FALCONKV_STORE_LISTEN_PORT", config.store.listen_port);
     config.store.heartbeat_sec = GetEnvOrDefaultUInt("FALCONKV_STORE_HEARTBEAT_SEC", config.store.heartbeat_sec);
-    config.store.buffer_pool_size = GetEnvOrDefaultUInt("FALCONKV_BUFFER_POOL_SIZE", config.store.buffer_pool_size);
     config.store.evict_grace_period_ms = GetEnvOrDefaultUInt("FALCONKV_EVICT_GRACE_PERIOD_MS", config.store.evict_grace_period_ms);
     config.store.evict_check_interval_sec = GetEnvOrDefaultUInt("FALCONKV_EVICT_CHECK_INTERVAL_SEC", config.store.evict_check_interval_sec);
     config.store.evict_high_watermark = GetEnvOrDefaultDouble("FALCONKV_EVICT_HIGH_WATERMARK", config.store.evict_high_watermark);
     config.store.evict_low_watermark = GetEnvOrDefaultDouble("FALCONKV_EVICT_LOW_WATERMARK", config.store.evict_low_watermark);
     config.store.evict_cold_threshold_ms = GetEnvOrDefaultUInt("FALCONKV_EVICT_COLD_THRESHOLD_MS", static_cast<uint32_t>(config.store.evict_cold_threshold_ms));
+    config.store.io_uring_enabled = GetEnvOrDefault("FALCONKV_IO_URING_ENABLED", config.store.io_uring_enabled ? "1" : "0") == "1";
+    config.store.direct_io_enabled = GetEnvOrDefault("FALCONKV_DIRECT_IO_ENABLED", config.store.direct_io_enabled ? "1" : "0") == "1";
+    config.store.io_uring_queue_depth = GetEnvOrDefaultUInt("FALCONKV_IO_URING_QUEUE_DEPTH", config.store.io_uring_queue_depth);
+    config.store.slot_size_bytes = GetEnvOrDefaultUInt("FALCONKV_SLOT_SIZE_BYTES", config.store.slot_size_bytes);
 
     // Scheduler config overrides
     config.scheduler.uds_path = GetEnvOrDefault("FALCONKV_SCHED_UDS_PATH", config.scheduler.uds_path);
@@ -145,7 +147,6 @@ void PropagateCommonToModules(FalconKVConfig& config) {
 void ParseMetaConfig(const Json::Value& root, MetaConfig& cfg) {
     if (!root.isMember("meta")) return;
     const auto& m = root["meta"];
-    if (m.isMember("listen_addr"))        cfg.listen_addr = m["listen_addr"].asString();
     if (m.isMember("shard_count"))        cfg.shard_count = m["shard_count"].asInt();
     if (m.isMember("page_size"))          cfg.page_size = m["page_size"].asUInt();
     if (m.isMember("heartbeat_timeout_sec")) cfg.heartbeat_timeout_sec = m["heartbeat_timeout_sec"].asInt();
@@ -162,13 +163,16 @@ void ParseStoreConfig(const Json::Value& root, StoreConfig& cfg) {
     if (s.isMember("alignment"))          cfg.alignment = s["alignment"].asUInt();
     if (s.isMember("listen_port"))        cfg.listen_port = s["listen_port"].asUInt();
     if (s.isMember("heartbeat_sec"))      cfg.heartbeat_sec = s["heartbeat_sec"].asUInt();
-    if (s.isMember("buffer_pool_size"))   cfg.buffer_pool_size = s["buffer_pool_size"].asUInt();
     if (s.isMember("store_rpc_host"))     cfg.store_rpc_host = s["store_rpc_host"].asString();
     if (s.isMember("evict_grace_period_ms"))   cfg.evict_grace_period_ms = s["evict_grace_period_ms"].asUInt();
     if (s.isMember("evict_check_interval_sec")) cfg.evict_check_interval_sec = s["evict_check_interval_sec"].asUInt();
     if (s.isMember("evict_high_watermark"))    cfg.evict_high_watermark = s["evict_high_watermark"].asDouble();
     if (s.isMember("evict_low_watermark"))     cfg.evict_low_watermark = s["evict_low_watermark"].asDouble();
     if (s.isMember("evict_cold_threshold_ms")) cfg.evict_cold_threshold_ms = static_cast<uint64_t>(s["evict_cold_threshold_ms"].asUInt64());
+    if (s.isMember("io_uring_enabled"))       cfg.io_uring_enabled = s["io_uring_enabled"].asBool();
+    if (s.isMember("direct_io_enabled"))      cfg.direct_io_enabled = s["direct_io_enabled"].asBool();
+    if (s.isMember("io_uring_queue_depth"))   cfg.io_uring_queue_depth = s["io_uring_queue_depth"].asUInt();
+    if (s.isMember("slot_size_bytes"))        cfg.slot_size_bytes = s["slot_size_bytes"].asUInt();
 }
 
 void ParseSchedulerConfig(const Json::Value& root, SchedulerConfig& cfg) {
@@ -188,8 +192,6 @@ void ParseClientConfig(const Json::Value& root, ClientConfig& cfg) {
     if (c.isMember("cache_capacity"))          cfg.cache_capacity = static_cast<size_t>(c["cache_capacity"].asUInt64());
     if (c.isMember("async_batch_size"))        cfg.async_batch_size = c["async_batch_size"].asInt();
     if (c.isMember("fire_and_forget"))         cfg.fire_and_forget = c["fire_and_forget"].asBool();
-    if (c.isMember("preallocation_count"))     cfg.preallocation_count = c["preallocation_count"].asUInt();
-    if (c.isMember("preallocation_enabled"))   cfg.preallocation_enabled = c["preallocation_enabled"].asBool();
 }
 
 void ParseTransferConfig(const Json::Value& root, TransferConfig& cfg) {

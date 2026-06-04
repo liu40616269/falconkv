@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <memory>
 
 #include <brpc/channel.h>
@@ -34,6 +35,17 @@ public:
     Status Read(uint64_t offset, void* buffer, uint32_t size,
                 uint32_t client_id = 0,
                 const std::string& source_node_addr = "");
+
+    /// Batch read multiple segments from the remote store in a single RPC.
+    /// @param offsets  Segment offsets.
+    /// @param sizes    Segment sizes.
+    /// @param buffers  Pre-allocated output buffers (one per segment).
+    /// @param results  Output: bytes read per segment (-1 on failure).
+    /// @return OK if the RPC itself succeeded; individual failures are in results.
+    Status BatchRead(const std::vector<uint64_t>& offsets,
+                     const std::vector<uint32_t>& sizes,
+                     const std::vector<void*>& buffers,
+                     std::vector<int32_t>& results);
 
     /// Ping the remote store.
     Status Ping();

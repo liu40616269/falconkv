@@ -32,6 +32,7 @@ protected:
         store_config.node_id = 1;
         store_config.capacity_bytes = 16 * 1024 * 1024;
         store_config.page_size = 4096;
+        store_config.slot_size_bytes = 4096;
         store_config.disable_mtime = true;
         store_config.scheduler_enabled = false;
 
@@ -196,6 +197,7 @@ TEST_F(ClientBatchOpsTest, BatchPutNoSpace) {
     // Power-of-2 pages for buddy allocator: 4 pages.
     config.capacity_bytes = 4 * 4096;
     config.page_size = 4096;
+    config.slot_size_bytes = 4096;
     config.disable_mtime = true;
     config.scheduler_enabled = false;
 
@@ -218,10 +220,11 @@ TEST_F(ClientBatchOpsTest, BatchPutNoSpace) {
         ASSERT_TRUE(r[0].ok()) << "Fill " << i << " failed";
     }
 
-    // 5th put should fail with kNoSpace.
+    // 5th put triggers forced eviction of the LRU entry, then succeeds.
+    // This is the new behavior: Put auto-evicts when full.
     auto r2 = client.BatchPut({"overflow"}, {info});
-    EXPECT_FALSE(r2[0].ok());
-    EXPECT_TRUE(r2[0].IsNoSpace()) << "Expected kNoSpace, got: " << r2[0].msg();
+    EXPECT_TRUE(r2[0].ok()) << "Expected OK after forced eviction, got: "
+                             << r2[0].ToString();
 
     client.Close();
     tiny_store.Close();

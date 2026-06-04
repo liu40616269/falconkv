@@ -2,7 +2,7 @@
 
 #include "src/store/store_meta_index.h"
 #include "src/store/pending_evict_queue.h"
-#include "src/common/buddy_allocator.h"
+#include "src/common/slot_allocator.h"
 
 using namespace falconkv;
 
@@ -11,7 +11,7 @@ using namespace falconkv;
 // ---------------------------------------------------------------------------
 TEST(EvictManagerTest, ColdEntrySelectionAndEviction) {
     StoreMetaIndex idx;
-    BuddyAllocator alloc(4096 * 64, 4096);
+    SlotAllocator alloc(4096 * 64, 4096);
 
     // Allocate space for each entry (simulating what FalconKVStore.Put does)
     std::vector<int64_t> offsets;
@@ -137,7 +137,7 @@ TEST(EvictManagerTest, BatchSizeLimit) {
 // ---------------------------------------------------------------------------
 TEST(EvictManagerTest, HighWatermarkTriggersEviction) {
     StoreMetaIndex idx;
-    BuddyAllocator alloc(4096 * 20, 4096);
+    SlotAllocator alloc(4096 * 20, 4096);
 
     // Fill to > 85% usage (18 of 20 pages).
     for (int i = 0; i < 18; ++i) {
@@ -184,7 +184,7 @@ TEST(EvictManagerTest, HighWatermarkTriggersEviction) {
 // ---------------------------------------------------------------------------
 TEST(EvictManagerTest, BelowHighWatermarkNoEviction) {
     StoreMetaIndex idx;
-    BuddyAllocator alloc(4096 * 100, 4096);
+    SlotAllocator alloc(4096 * 100, 4096);
 
     // Fill only 10 pages out of 100 (10% usage, well below 85%).
     for (int i = 0; i < 10; ++i) {

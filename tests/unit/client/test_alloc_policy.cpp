@@ -53,6 +53,7 @@ TEST(AllocPolicyTest, AccessTypeLocalDirect) {
     config.store_id = 1;
     config.capacity_bytes = 4 * 1024 * 1024;
     config.page_size = 4096;
+    config.slot_size_bytes = 4096;
     config.disable_mtime = true;
     config.scheduler_enabled = false;
 
@@ -144,10 +145,11 @@ TEST(AllocPolicyTest, AllStoresNoSpace) {
     FalconKVStore::Config config;
     config.ssd_path = tmp_dir;
     config.store_id = 3;
-    // capacity = 4 pages (power of 2 for buddy allocator), chunk = 1 page.
-    // BuddyAllocator: total_pages=4, max_order=2, can allocate exactly 4 chunks.
+    // capacity = 4 pages, chunk = 1 page.
+    // SlotAllocator: total_slots=4, can allocate exactly 4 chunks.
     config.capacity_bytes = 4 * 4096;
     config.page_size = 4096;
+    config.slot_size_bytes = 4096;
     config.disable_mtime = true;
     config.scheduler_enabled = false;
 
@@ -162,10 +164,20 @@ TEST(AllocPolicyTest, AllStoresNoSpace) {
         ASSERT_TRUE(result.status.ok()) << "Fill " << i << " failed";
     }
 
-    // 5th write should fail with kNoSpace.
+    // 5th write triggers forced eviction of the LRU entry ("fill_0"),
+    // then succeeds.  This is the new behavior: Put auto-evicts when full.
     auto result = store.Put("overflow", data.data(), data.size());
-    EXPECT_FALSE(result.status.ok());
-    EXPECT_TRUE(result.status.IsNoSpace()) << "Expected kNoSpace, got: " << result.status.msg();
+    EXPECT_TRUE(result.status.ok()) << "Expected OK after forced eviction, got: "
+                                    << result.status.ToString();
+
+    // The evicted key should no longer be accessible.
+    std::vector<uint8_t> buf(4096, 0);
+    auto get_result = store.Get("fill_0", buf.data(), buf.size());
+    EXPECT_FALSE(get_result.status.ok()) << "Evicted key should not be found";
+
+    // The new key should be readable.
+    get_result = store.Get("overflow", buf.data(), buf.size());
+    EXPECT_TRUE(get_result.status.ok()) << "New key should be readable";
 
     store.Close();
     std::string cmd = "rm -rf " + tmp_dir;

@@ -15,7 +15,8 @@ namespace falconkv {
 // Owns MetaManager + MetaServiceImpl + brpc::Server.
 class MetaServer {
 public:
-    explicit MetaServer(const MetaConfig& config);
+    explicit MetaServer(const MetaConfig& config,
+                        const std::string& meta_addr);
     ~MetaServer();
 
     // Non-copyable

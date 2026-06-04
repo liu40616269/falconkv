@@ -7,6 +7,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <deque>
 
 #include <brpc/channel.h>
 
@@ -30,8 +31,12 @@ public:
     /// Connect to the remote Meta server. Failure does not prevent startup.
     Status Connect(const std::string& meta_addr);
 
-    /// Sync committed key records to Meta.
+    /// Sync committed key records to Meta (blocking RPC).
     Status SyncCommit(uint32_t store_id, const std::vector<StoreKeyRecord>& records);
+
+    /// Async commit: enqueues records and returns immediately.
+    /// A background thread drains the queue and calls SyncCommit in batches.
+    void AsyncCommit(uint32_t store_id, const std::vector<StoreKeyRecord>& records);
 
     /// Sync removed/evicted keys to Meta.
     Status SyncRemove(uint32_t store_id, const std::vector<std::string>& keys);
@@ -70,6 +75,15 @@ private:
     /// Background thread function for reconnection loop.
     void ReconnectLoop(int interval_sec);
 
+    /// Background thread function for async commit drain.
+    void AsyncCommitLoop();
+
+    /// Start the async commit background thread.
+    void StartAsyncCommitThread();
+
+    /// Stop the async commit background thread.
+    void StopAsyncCommitThread();
+
     std::unique_ptr<brpc::Channel> channel_;
     std::unique_ptr<FalconKVMetaService_Stub> stub_;
     std::atomic<bool> connected_{false};
@@ -93,6 +107,17 @@ private:
     std::atomic<bool> reconnect_running_{false};
     std::mutex reconnect_mutex_;
     std::condition_variable reconnect_cv_;
+
+    // Async commit queue + drain thread
+    struct PendingCommit {
+        uint32_t store_id;
+        std::vector<StoreKeyRecord> records;
+    };
+    std::deque<PendingCommit> pending_commits_;
+    std::mutex commit_mutex_;
+    std::condition_variable commit_cv_;
+    std::thread commit_thread_;
+    std::atomic<bool> commit_running_{false};
 };
 
 } // namespace falconkv

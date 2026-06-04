@@ -69,14 +69,14 @@ def _make_client(ssd_dir, log_dir="/tmp/falconkv_log", store_id=1, capacity_gb=1
             "capacity_gb": capacity_gb,
             "page_size": page_size,
             "io_threads": 2,
-            "buffer_pool_size": 4,
+            "io_uring_enabled": False,
+            "direct_io_enabled": False,
             "scheduler_enabled": False,
         },
         "client": {
             "cache_capacity": 10000,
             "scheduler_enabled": False,
         },
-        "meta": {"listen_addr": "0.0.0.0:19999"},
         "scheduler": {"uds_path": "/tmp/nonexistent.sock"},
         "transfer": {"meta_addr": "localhost:19999"},
     }

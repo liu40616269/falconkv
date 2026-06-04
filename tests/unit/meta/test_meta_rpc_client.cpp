@@ -14,9 +14,8 @@ class MetaRpcClientTest : public ::testing::Test {
 protected:
     void SetUp() override {
         MetaConfig cfg;
-        cfg.listen_addr = "127.0.0.1:19876";
 
-        server_ = std::make_unique<MetaServer>(cfg);
+        server_ = std::make_unique<MetaServer>(cfg, "127.0.0.1:19876");
 
         // Register a store
         StoreInfo info;

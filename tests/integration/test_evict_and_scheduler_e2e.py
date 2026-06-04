@@ -110,12 +110,13 @@ def _grep_log(log_path, pattern):
 # Helper — create evict client
 # ---------------------------------------------------------------------------
 
-def _make_evict_client(ssd_dir, log_dir="/tmp/falconkv_log"):
+def _make_evict_client(ssd_dir, log_dir="/tmp/falconkv_log", meta_addr="localhost:19999"):
     """Create a pyfalconkv.Client with 1 GB capacity and fast eviction params."""
     from pyfalconkv.client import Client
 
     config = {
         "common": {
+            "meta_addr": meta_addr,
             "log_dir": log_dir,
             "scheduler_enabled": False,
             "scheduler_uds_path": "/tmp/nonexistent.sock",
@@ -127,9 +128,10 @@ def _make_evict_client(ssd_dir, log_dir="/tmp/falconkv_log"):
             "capacity_gb": 1,                # 1 GB
             "page_size": 4096,
             "io_threads": 2,
-            "buffer_pool_size": 4,
             "store_rpc_host": "127.0.0.1",
             "listen_port": 18901,
+            "io_uring_enabled": False,
+            "direct_io_enabled": False,
             "evict_grace_period_ms": 1000,
             "evict_check_interval_sec": 1,
             "evict_high_watermark": 0.80,
@@ -140,9 +142,8 @@ def _make_evict_client(ssd_dir, log_dir="/tmp/falconkv_log"):
             "cache_capacity": 100000,
             "scheduler_enabled": False,
         },
-        "meta": {"listen_addr": "0.0.0.0:19999"},
         "scheduler": {"uds_path": "/tmp/nonexistent.sock"},
-        "transfer": {"meta_addr": "localhost:19999"},
+        "transfer": {"meta_addr": meta_addr},
     }
     config_path = os.path.join(ssd_dir, "evict_config.json")
     os.makedirs(ssd_dir, exist_ok=True)
@@ -176,7 +177,6 @@ def _make_scheduler_client(ssd_dir, meta_addr, scheduler_uds_path,
             "capacity_gb": 1,
             "page_size": 4096,
             "io_threads": 2,
-            "buffer_pool_size": 4,
             "store_rpc_host": "127.0.0.1",
             "listen_port": listen_port,
         },
@@ -184,9 +184,6 @@ def _make_scheduler_client(ssd_dir, meta_addr, scheduler_uds_path,
             "cache_capacity": 100000,
             "scheduler_enabled": True,
             "scheduler_uds_path": scheduler_uds_path,
-        },
-        "meta": {
-            "listen_addr": meta_addr,
         },
         "scheduler": {
             "uds_path": scheduler_uds_path,
@@ -208,7 +205,7 @@ def _make_scheduler_client(ssd_dir, meta_addr, scheduler_uds_path,
 class TestStoreEviction:
     """Store capacity exhausted -> EvictManager reclaims cold entries -> new writes succeed."""
 
-    def test_evict_frees_space_for_new_writes(self, temp_ssd_dir, test_log_dir):
+    def test_evict_frees_space_for_new_writes(self, temp_ssd_dir, test_log_dir, meta_server):
         """Write keys until the store is full, wait for eviction, then verify new keys can be written.
 
         Steps:
@@ -218,10 +215,11 @@ class TestStoreEviction:
         4. Phase 2: Write new keys and verify they succeed (space was reclaimed).
         5. Verify some old keys are no longer readable (evicted).
         """
-        client = _make_evict_client(temp_ssd_dir, log_dir=test_log_dir)
+        client = _make_evict_client(temp_ssd_dir, log_dir=test_log_dir,
+                                    meta_addr=meta_server["addr"])
         try:
             value_size = 1024 * 1024  # 1 MB per key
-            # 1 GB / 1 MB = 1024 pages (buddy allocator units).
+            # 1 GB / 1 MB = 1024 pages (slot allocator units).
             # High watermark 80% = ~819 pages.  Write ~830 keys to exceed it.
             phase1_count = 830
             phase1_keys = []
@@ -260,13 +258,14 @@ class TestStoreEviction:
             assert r.read_bytes() == phase2_data, "Phase-2 data mismatch"
 
             # Verify at least some old keys are gone (evicted).
+            # Use batch_exist_sync which queries the store's meta_index directly
+            # (not the client's KeyDescCache), so evicted keys are correctly
+            # reported as missing.
             missing = 0
             check_count = min(100, len(phase1_keys))
-            for key, _ in phase1_keys[:check_count]:
-                r_old = ZeroBuffer(value_size)
-                res = client.batch_get_sync([key], [r_old.ptr], [r_old.size])
-                if res[0] <= 0:
-                    missing += 1
+            check_keys = [key for key, _ in phase1_keys[:check_count]]
+            exist_count = client.batch_exist_sync(check_keys)
+            missing = check_count - exist_count
             assert missing > 0, (
                 f"Expected some phase-1 keys to be evicted, but all {check_count} are still present"
             )

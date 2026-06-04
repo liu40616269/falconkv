@@ -1,5 +1,8 @@
 #include "falconkv_bridge.h"
 
+#include <brpc/protocol.h>
+#include <gflags/gflags.h>
+
 #include "src/client/falconkv_client_impl.h"
 #include "src/store/falconkv_store.h"
 #include "src/common/config.h"
@@ -16,6 +19,20 @@ FalconKVBridge::FalconKVBridge(const Config& config) {
 
     // 初始化共享日志（InitSharedLogging 内部保证 google::InitGoogleLogging 只执行一次）
     falconkv::InitSharedLogging(cfg.common.log_dir, "falconkv_client");
+
+    // Increase brpc max body size for large batch RPCs (default 64MB is too
+    // small for BatchRead with many 1MB segments).
+    gflags::SetCommandLineOption("max_body_size", "536870912");
+
+    // 当 worker_id >= 0 时，自动计算 store_id = node_id * 10 + worker_id
+    if (config.worker_id >= 0) {
+        uint32_t old_store_id = cfg.store.store_id;
+        cfg.store.store_id = cfg.store.node_id * 10 + config.worker_id;
+        LOG(INFO) << "[FalconKVBridge] LMCache worker_id=" << config.worker_id
+                  << ", node_id=" << cfg.store.node_id
+                  << ", computed store_id=" << cfg.store.store_id
+                  << " (overrides store_id=" << old_store_id << ")";
+    }
 
     // 创建并初始化 FalconKVStore
     store_ = std::make_unique<FalconKVStore>(

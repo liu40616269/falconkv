@@ -18,13 +18,14 @@ class Client:
     Internally manages a handle that identifies the FalconKVBridge instance.
     """
 
-    def __init__(self, config_file: str, cache_capacity: int = 100000):
+    def __init__(self, config_file: str, cache_capacity: int = 100000,
+                 worker_id: int = -1):
         if _internal is None:
             raise RuntimeError(
                 "_pyfalconkv_internal C extension not found. "
                 "Build with: ./build.sh build --with-python"
             )
-        self._handle = _internal.Init(config_file, cache_capacity)
+        self._handle = _internal.Init(config_file, cache_capacity, worker_id)
 
     def batch_exist_sync(self, keys: list) -> int:
         """Batch check key existence.

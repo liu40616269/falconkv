@@ -201,13 +201,42 @@ scheduler模块也是一个独立启动的进程, 进程名叫falconkv_scheduler
 第二十四轮交互:
 当前KeyDescCache的LRU算法很低效,lru_list_是一个简单链表, 链表中存的是key值, 这导致每次查询后将查询到的key移到lru_list尾部时, 需要遍历完整队列在push_back, 这很低效,性能极差; 请设计高性能的LRU淘汰机制支撑高性能.
 
+第二十五轮交互:
+当前store的驱逐机制存在如下问题,请设计优化方案 
+1. 当前写入过快时, 清理不及时导致分片空间失败, 需要在lease清理的基础上提供一种强制清理机制, 当前定时基于cold_threshold_ms清理可能导致空间无法被清理(例如空间过小,都是热数据)
+   请先替换为LRU清理, 避免写失败
+2. 当前的清理遍历机制效率过低, 需要修改数据结构为 hash+链表的LRU结构
+3. 在store put阶段若alloc空间失败, 需要立即触发清理, 在清理完成后重新申请空间; 这里需要打印日志明确空间耗尽,触发了主动清理
+
+第二十六轮交互:
+当前FalconKVStore::BatchPut并没有使用ioring机制也没有使用多线程并发机制提升性能, FalconKVStore::BatchRead直接使用了 std::async并不高效, 请结合ioring和固定线程池提供高性能的并发方案设计
+
+第二十七轮交互:
+在falconkv 和lmcache集成时需要从lmcache中获取workid,并传递给falconkv作为store_id使用;lmcache中获取workid的方式为 worker_id = os.getenv("LMCACHE_PLUGIN_WORKER_ID", "0"),请修改falconkv实现该机制, 同时由于vllm推理集群一般会存在多个节点每个节点内的worker_id唯一,节点间不唯一;为了确保store_id全局唯一,     不能直接将worker_id 作为falconkv的store_id, 需要使用falconkv的node_id * 10+work_id作为falconkv的store_id避免全局空间冲突.
+
+第二十八轮交互:
+当前FalconKVStore::Write和FalconKVStore::Read在判断未做对齐后会进行对齐处理和内存copy后再次使用原fd写入, 重新对齐后进行的读写位置均发生了变化.
+请修改为对文件打开两次, 分别使用O_DIRECT模式和非O_DIRECT模式, 当前配置开启o_direct模式且满足对齐条件时使用 direct 对应的fd进行读写, 否则使用非direct的fd进行读写;
+请分析该方案是否可行,若可行请基于当前代码实施修改.
+
+第二十九轮交互:
+当前falconkv的客户端在进行ACCESS_LOCAL_DIRECT数据读写时,已经支持了IORING和多线程并发处理, 但是ACCESS_NODE_DIRECT依然采用低效的单线程循环处理, 请参考ACCESS_LOCAL_DIRECT的处理机制为ACCESS_NODE_DIRECT也实现多线程和IO_RING处理
+
+第三十轮交互:
+当前store模块已经使用双fd机制来进行文件读写, 对其且支持direct_io就是用direct_io对应的fd, 否则使用buffer_fd; 因此请分析确认是否还有必要保留慢速读写逻辑, 如不需要请给出整改方案.
+
+第三十一轮交互:
+当前falconkv的store模块使用SlotAllocator进行文件空间分配, 每次分配的size固定, 但是需要从配置文件中读取每次的分配size; 这需要在部署时识别模型需要存储的size, 这增加了对部署人员的知识要求;
+虽然模型部署后每次使用的size都是固定的,但不易在部署时获得具体是多大, falconkv需要根据alloc设置size大小而不是启动时设定, 且若申请多次申请的size大小发生变化需要抛出异常,表示当前不支持多种size;
+请设计方案支持这种情况.
+
 其他待处理:
 1. FireAndForgetPut的逻辑存在错误, 需要将FireAndForgetPut的优先级低于读数据的优先级别, 但是当前并没有这种处理
    可以先对接待后续完善
 2. 当前并能不支持从磁盘恢复Meta信息, 后续使用pwritev+preadv 读写meta + data的模式存放数据, 同时通过bitmap来标记有效block位置, 定期持久化bitmap来用于数据恢复.
-3. 当前的清理逻辑并没有使用LRU实时排序, 清理时进行全局遍历, 这很低效需要进行优化
-4. 当前并没有开启多线程处理机制,可以设计开启读写支持多线程并发处理(同时本地也需要Key值Hash分片适配多线程机制)
-5. 当前rpc通信存在延时问题,需要将速率统计的的RPC消息修改为提交异步任务上报速率统计
-6. 考虑如何支持集成HCCL进行通信
+3. 当前rpc通信存在延时问题,需要将速率统计的的RPC消息修改为提交异步任务上报速率统计
+4. 考虑如何支持集成HCCL进行通信
+
+
 
 

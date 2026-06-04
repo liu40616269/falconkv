@@ -9,6 +9,7 @@ namespace falconkv {
 MetaSyncClient::MetaSyncClient() = default;
 
 MetaSyncClient::~MetaSyncClient() {
+    StopAsyncCommitThread();
     StopReconnectLoop();
 }
 
@@ -55,6 +56,7 @@ Status MetaSyncClient::Connect(const std::string& meta_addr) {
     } else {
         LOG(INFO) << "[MetaSyncClient] Initial connect succeeded to Meta at " << meta_addr_;
         FullResync();
+        StartAsyncCommitThread();
     }
     return Status::OK();
 }
@@ -129,6 +131,80 @@ Status MetaSyncClient::SyncCommit(uint32_t store_id,
     }
 
     return Status::OK();
+}
+
+// -----------------------------------------------------------------
+// AsyncCommit — non-blocking enqueue
+// -----------------------------------------------------------------
+
+void MetaSyncClient::AsyncCommit(uint32_t store_id,
+                                  const std::vector<StoreKeyRecord>& records) {
+    if (records.empty()) return;
+
+    {
+        std::lock_guard<std::mutex> lock(commit_mutex_);
+        pending_commits_.push_back({store_id, records});
+    }
+    commit_cv_.notify_one();
+}
+
+// -----------------------------------------------------------------
+// Async commit background thread
+// -----------------------------------------------------------------
+
+void MetaSyncClient::StartAsyncCommitThread() {
+    if (commit_running_.load()) return;
+    commit_running_.store(true);
+    commit_thread_ = std::thread(&MetaSyncClient::AsyncCommitLoop, this);
+}
+
+void MetaSyncClient::StopAsyncCommitThread() {
+    if (!commit_running_.load()) return;
+    commit_running_.store(false);
+    commit_cv_.notify_all();
+    if (commit_thread_.joinable()) {
+        commit_thread_.join();
+    }
+}
+
+void MetaSyncClient::AsyncCommitLoop() {
+    LOG(INFO) << "[MetaSyncClient] AsyncCommit thread started";
+    while (commit_running_.load()) {
+        std::deque<PendingCommit> batch;
+
+        {
+            std::unique_lock<std::mutex> lock(commit_mutex_);
+            commit_cv_.wait(lock, [this] {
+                return !pending_commits_.empty() || !commit_running_.load();
+            });
+
+            if (!commit_running_.load() && pending_commits_.empty()) {
+                break;
+            }
+
+            // Drain entire queue into local batch
+            batch = std::move(pending_commits_);
+            pending_commits_.clear();
+        }
+
+        if (batch.empty()) continue;
+
+        // Merge all pending records into a single RPC call
+        std::vector<StoreKeyRecord> merged;
+        uint32_t sid = batch[0].store_id;
+        for (auto& pc : batch) {
+            for (auto& r : pc.records) {
+                merged.push_back(std::move(r));
+            }
+        }
+
+        Status s = SyncCommit(sid, merged);
+        if (!s.ok()) {
+            LOG(WARNING) << "[MetaSyncClient] AsyncCommit SyncCommit failed: "
+                         << s.ToString();
+        }
+    }
+    LOG(INFO) << "[MetaSyncClient] AsyncCommit thread stopped";
 }
 
 // -----------------------------------------------------------------

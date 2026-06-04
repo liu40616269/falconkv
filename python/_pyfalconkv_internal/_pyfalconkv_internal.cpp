@@ -56,12 +56,14 @@ static falconkv::FalconKVBridge* handle_to_bridge(PyObject* handle_obj) {
 static PyObject* PyWrapper_Init(PyObject* /*self*/, PyObject* args) {
     const char* config_file = nullptr;
     Py_ssize_t cache_capacity = 100000;
-    if (!PyArg_ParseTuple(args, "s|n", &config_file, &cache_capacity))
+    int worker_id = -1;
+    if (!PyArg_ParseTuple(args, "s|ni", &config_file, &cache_capacity, &worker_id))
         return nullptr;
 
     falconkv::FalconKVBridge::Config config;
     config.config_file = config_file ? config_file : "";
     config.cache_capacity = static_cast<size_t>(cache_capacity);
+    config.worker_id = worker_id;
 
     falconkv::FalconKVBridge* bridge = nullptr;
     try {
@@ -327,7 +329,7 @@ static PyMethodDef PyFalconKVInternalMethods[] = {
      PyWrapper_Init,
      METH_VARARGS,
      "Initialize FalconKV bridge.\n"
-     "Args: config_file (str), [cache_capacity (int)]\n"
+     "Args: config_file (str), [cache_capacity (int), [worker_id (int)]]\n"
      "Returns: handle (int)"},
     {"BatchExistSync",
      PyWrapper_BatchExistSync,

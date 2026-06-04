@@ -16,7 +16,6 @@ struct CommonConfig {
 };
 
 struct MetaConfig {
-    std::string listen_addr = "0.0.0.0:8900";
     int shard_count = 64;
     uint32_t page_size = 4096;
     int heartbeat_timeout_sec = 30;
@@ -32,7 +31,6 @@ struct StoreConfig {
     uint32_t alignment = 512;
     uint32_t listen_port = 8901;
     uint32_t heartbeat_sec = 5;
-    uint32_t buffer_pool_size = 64;
     bool scheduler_enabled = true;
     std::string scheduler_uds_path = "/tmp/falconkv_scheduler.sock";
     int scheduler_rpc_timeout_us = 2000;
@@ -45,6 +43,10 @@ struct StoreConfig {
     double evict_high_watermark = 0.85;
     double evict_low_watermark = 0.70;
     uint64_t evict_cold_threshold_ms = 300000;
+    bool io_uring_enabled = true;
+    bool direct_io_enabled = true;
+    uint32_t io_uring_queue_depth = 128;
+    uint32_t slot_size_bytes = 0;  // 0 = auto-detect from first write, >0 = explicit slot size
 };
 
 struct SchedulerConfig {
@@ -63,8 +65,6 @@ struct ClientConfig {
     size_t cache_capacity = 100000;
     int async_batch_size = 16;
     bool fire_and_forget = true;
-    uint32_t preallocation_count = 1000;
-    bool preallocation_enabled = true;
     bool scheduler_enabled = true;
     std::string scheduler_uds_path = "/tmp/falconkv_scheduler.sock";
     int scheduler_rpc_timeout_us = 2000;

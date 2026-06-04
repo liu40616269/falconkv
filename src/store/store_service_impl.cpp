@@ -16,7 +16,7 @@ StoreServiceImpl::StoreServiceImpl(FalconKVStore* store)
 // -----------------------------------------------------------------
 // Read (offset-based, for remote client backward compatibility)
 // -----------------------------------------------------------------
-void StoreServiceImpl::Read(::google::protobuf::RpcController*,
+void StoreServiceImpl::Read(::google::protobuf::RpcController* controller,
                              const ReadRequest* request,
                              ReadResponse* response,
                              ::google::protobuf::Closure* done) {
@@ -55,15 +55,19 @@ void StoreServiceImpl::Read(::google::protobuf::RpcController*,
     }
 
     response->set_status(0);
-    response->set_data(buffer, size);
     response->set_bytes_read(size);
-    AlignedAllocator::Free(buffer);
+
+    // Zero-copy: transfer buffer ownership to brpc attachment.
+    // The deleter frees the buffer after brpc finishes sending.
+    auto* cntl = static_cast<brpc::Controller*>(controller);
+    cntl->response_attachment().append_user_data(
+        buffer, size, AlignedAllocator::Free);
 }
 
 // -----------------------------------------------------------------
 // BatchRead (offset-based)
 // -----------------------------------------------------------------
-void StoreServiceImpl::BatchRead(::google::protobuf::RpcController*,
+void StoreServiceImpl::BatchRead(::google::protobuf::RpcController* controller,
                                   const BatchReadRequest* request,
                                   BatchReadResponse* response,
                                   ::google::protobuf::Closure* done) {
@@ -107,9 +111,25 @@ void StoreServiceImpl::BatchRead(::google::protobuf::RpcController*,
     }
 
     response->set_status(s.ok() ? 0 : static_cast<int>(s.code()));
-    for (const auto& item : items) {
-        response->add_data_segments(item.buffer, item.size);
-        response->add_bytes_read(s.ok() ? item.size : 0);
+    if (!s.ok()) {
+        for (size_t i = 0; i < items.size(); ++i) {
+            response->add_bytes_read(0);
+        }
+        return;
+    }
+
+    // Fill bytes_read metadata.
+    for (size_t i = 0; i < items.size(); ++i) {
+        response->add_bytes_read(items[i].size);
+    }
+
+    // Zero-copy: transfer each buffer's ownership to brpc attachment.
+    // Layout: [seg0_data][seg1_data]...[segN_data] concatenated sequentially.
+    // Client uses bytes_read[] to locate each segment's offset.
+    auto* cntl = static_cast<brpc::Controller*>(controller);
+    for (size_t i = 0; i < items.size(); ++i) {
+        cntl->response_attachment().append_user_data(
+            buffers[i].release(), items[i].size, AlignedAllocator::Free);
     }
 }
 
