@@ -347,6 +347,83 @@ sudo dnf install -y python3-devel
 ./build.sh build --with-python
 ```
 
+构建完成后，C Extension 模块 `_pyfalconkv_internal.cpython-3XX-x86_64-linux-gnu.so` 会自动复制到 `python/pyfalconkv/` 目录下。
+
+### 3.6 安装 Python 包（pyfalconkv）
+
+构建完成后，需将 `pyfalconkv` 包安装到 Python 环境中。项目提供了 `setup.py`，支持以可编辑模式（开发模式）或正式模式安装。
+
+#### 3.6.1 可编辑模式安装（推荐开发使用）
+
+```bash
+cd python
+pip install -e .
+```
+
+此模式下修改 Python 代码后无需重新安装即可生效。但若 C Extension 发生变更，需重新执行 `./build.sh build --with-python`。
+
+#### 3.6.2 正式模式安装
+
+```bash
+cd python
+pip install .
+```
+
+#### 3.6.3 验证安装
+
+安装完成后，可通过以下方式验证：
+
+```bash
+# 验证包是否可导入
+python3 -c "import pyfalconkv; print(pyfalconkv.__version__)"
+
+# 验证 C Extension 是否加载成功
+python3 -c "from pyfalconkv import _pyfalconkv_internal; print('C Extension loaded')"
+```
+
+预期输出：
+
+```
+0.1.0
+C Extension loaded
+```
+
+> **注意：** 若提示 `_pyfalconkv_internal C extension not found`，说明未使用 `--with-python` 选项构建，或 `.so` 文件未正确复制到 `python/pyfalconkv/` 目录。请先执行 `./build.sh build --with-python`。
+
+#### 3.6.4 包结构说明
+
+安装后的 `pyfalconkv` 包结构如下：
+
+```
+pyfalconkv/
+├── __init__.py                          # 包入口，导出 Client 类
+├── client.py                            # 高层 Python Client 封装
+├── adapter.py                           # LMCache 适配器（falconkv:// URL 自动发现）
+├── connector.py                         # LMCache RemoteConnector 实现
+└── _pyfalconkv_internal.cpython-*.so    # C Extension 模块（编译产物）
+```
+
+#### 3.6.5 基本使用示例
+
+```python
+from pyfalconkv import Client
+
+# 创建客户端（需提供 FalconKV 配置文件路径）
+client = Client(config_file="/usr/local/falconkv/config/falconkv.json")
+
+# 批量检查 key 是否存在
+hit_count = client.batch_exist_sync(["key1", "key2", "key3"])
+
+# 批量写入
+client.batch_put_sync(keys, data_ptrs, sizes)
+
+# 批量读取
+results = client.batch_get_sync(keys, data_ptrs, sizes)
+
+# 关闭客户端
+client.close()
+```
+
 ---
 
 ## 4. 快速验证

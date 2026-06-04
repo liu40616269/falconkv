@@ -28,7 +28,10 @@ FalconKVClientImpl::FalconKVClientImpl(const Config& config)
 
     // Connect to remote Meta server via RPC
     Status meta_status = meta_client_.Connect(cfg.transfer.meta_addr);
-    if (!meta_status.ok()) {
+    if (meta_status.ok()) {
+        LOG(INFO) << "[FalconKVClient] Connected to Meta server at "
+                  << cfg.transfer.meta_addr;
+    } else {
         LOG(WARNING) << "[FalconKVClient] Failed to connect to Meta server: "
                      << meta_status.ToString()
                      << " (will retry via background reconnect loop)";
@@ -50,6 +53,9 @@ FalconKVClientImpl::FalconKVClientImpl(const Config& config)
                                                              cfg.client.scheduler_rpc_timeout_us / 1000,
                                                              cfg.client.max_consecutive_failures,
                                                              cfg.client.reconnect_interval_sec);
+        LOG(INFO) << "[FalconKVClient] SchedulerProxy enabled, uds_path=" << sched_uds;
+    } else {
+        LOG(INFO) << "[FalconKVClient] SchedulerProxy disabled";
     }
 
     // Start background reconnect loop for Meta RPC client.
@@ -368,10 +374,6 @@ std::vector<int32_t> FalconKVClientImpl::BatchGetSync(
     std::vector<KeyDescriptor> hit_descs;
     std::vector<std::string> missing_keys;
     key_desc_cache_.BatchLookup(keys, hit_descs, missing_keys);
-
-    LOG(INFO) << "[BatchGetSync] keys=" << keys.size()
-              << " cache_hits=" << hit_descs.size()
-              << " missing=" << missing_keys.size();
 
     // Build a map of key -> descriptor for cache hits
     std::unordered_map<std::string, KeyDescriptor> hit_map;

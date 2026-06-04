@@ -2,7 +2,8 @@
 """Aggregate perf test results from all clients and print summary.
 
 Usage:
-    python perf_aggregate.py --result-dir /tmp/falconkv_perf_result --client-ids "A B C"
+    python perf_aggregate.py --result-dir /tmp/falconkv_perf_result \
+                             --client-ids "A B C"
 
 Reads each client's result_{id}.json, prints a summary table, and writes
 summary.json to the result directory.
@@ -46,21 +47,22 @@ def main():
         try:
             results[cid] = _load_result(args.result_dir, cid)
         except FileNotFoundError:
-            print(f"WARNING: result file for client '{cid}' not found, skipping")
+            print(f"WARNING: result file for client '{cid}' not found, "
+                  f"skipping")
 
     if not results:
         print("ERROR: No result files found.")
         sys.exit(1)
 
     # Print summary table
-    sep = "-" * 100
+    sep = "-" * 115
     print()
-    print("=" * 100)
+    print("=" * 115)
     print("  FalconKV Performance Summary")
-    print("=" * 100)
-    print(f"  {'Client':<7} | {'Op':<6} | {'Total':>6} | {'Avg(ms)':>8} | "
-          f"{'P50(ms)':>8} | {'P95(ms)':>8} | {'P99(ms)':>8} | "
-          f"{'Ops/s':>8} | {'MB/s':>6} | {'Errors':>6}")
+    print("=" * 115)
+    print(f"  {'Client':<7} | {'Role':<17} | {'Op':<6} | {'Total':>6} | "
+          f"{'Avg(ms)':>8} | {'P50(ms)':>8} | {'P95(ms)':>8} | "
+          f"{'P99(ms)':>8} | {'Ops/s':>8} | {'MB/s':>6} | {'Errors':>6}")
     print(f"  {sep}")
 
     summary_rows = []
@@ -71,11 +73,14 @@ def main():
         r = results[cid]
         node_id = r["node_id"]
         store_id = r["store_id"]
+        role = r.get("role", "unknown")
 
         for op in ("exist", "put", "get"):
             s = r[op]
             label = f"{cid}(n{node_id},s{store_id})"
-            print(f"  {label:<7} | {op:<6} | {s['total_ops']:>6} | "
+            role_short = role
+            print(f"  {label:<7} | {role_short:<17} | {op:<6} | "
+                  f"{s['total_ops']:>6} | "
                   f"{_fmt(s['avg_ms']):>8} | {_fmt(s['p50_ms']):>8} | "
                   f"{_fmt(s['p95_ms']):>8} | {_fmt(s['p99_ms']):>8} | "
                   f"{_fmt(s['throughput_ops']):>8} | "
@@ -85,11 +90,31 @@ def main():
                 "client_id": cid,
                 "node_id": node_id,
                 "store_id": store_id,
+                "role": role,
                 "op": op,
                 **s,
             })
 
-    print("=" * 100)
+    print("=" * 115)
+
+    # Print hit/miss and put exec/skip stats
+    print()
+    print("  Read/Write detail:")
+    print(f"  {'Client':<7} | {'Role':<17} | {'PutExec':>7} | "
+          f"{'PutSkip':>7} | {'GetHit':>7} | {'GetMiss':>7}")
+    print(f"  {sep}")
+    for cid in client_ids:
+        if cid not in results:
+            continue
+        r = results[cid]
+        label = f"{cid}(n{r['node_id']},s{r['store_id']})"
+        role = r.get("role", "unknown")
+        print(f"  {label:<7} | {role:<17} | "
+              f"{r.get('put_exec_count', 0):>7} | "
+              f"{r.get('put_skip_count', 0):>7} | "
+              f"{r.get('get_hit_count', 0):>7} | "
+              f"{r.get('get_miss_count', 0):>7}")
+    print(f"  {sep}")
 
     # Aggregate totals per operation
     print()
@@ -105,7 +130,8 @@ def main():
         total_ops = sum(r["total_ops"] for r in op_rows)
         # Weighted average
         if total_ops > 0:
-            avg = sum(r["avg_ms"] * r["total_ops"] for r in op_rows) / total_ops
+            avg = sum(r["avg_ms"] * r["total_ops"]
+                      for r in op_rows) / total_ops
         else:
             avg = 0.0
         total_throughput = sum(r["throughput_ops"] for r in op_rows)

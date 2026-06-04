@@ -46,6 +46,7 @@ SchedulerProxy::SchedulerProxy(const std::string& uds_path,
     // Attempt an initial probe.
     if (ProbeScheduler()) {
         state_.store(State::CONNECTED, std::memory_order_release);
+        LOG(INFO) << "[SchedulerProxy] Initial probe succeeded, scheduler available at " << uds_path_;
     } else {
         // Scheduler unreachable at startup — enter bypass mode immediately.
         state_.store(State::BYPASS, std::memory_order_release);
@@ -79,6 +80,7 @@ bool SchedulerProxy::Connect() {
         return false;
     }
     stub_ = std::make_unique<FalconKVSchedulerService_Stub>(channel_.get());
+    LOG(INFO) << "[SchedulerProxy] Connected to scheduler at " << uds_path_;
     return true;
 }
 

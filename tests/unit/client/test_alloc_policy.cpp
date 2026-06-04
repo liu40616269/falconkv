@@ -73,7 +73,7 @@ TEST(AllocPolicyTest, AccessTypeLocalDirect) {
 
     store.Close();
     std::string cmd = "rm -rf " + tmp_dir;
-    system(cmd.c_str());
+    if (system(cmd.c_str())) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +114,7 @@ TEST(AllocPolicyTest, AccessTypeNodeDirect) {
     accessor.Close();
 
     std::string cmd = "rm -rf " + tmp_dir;
-    system(cmd.c_str());
+    if (system(cmd.c_str())) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -169,5 +169,5 @@ TEST(AllocPolicyTest, AllStoresNoSpace) {
 
     store.Close();
     std::string cmd = "rm -rf " + tmp_dir;
-    system(cmd.c_str());
+    if (system(cmd.c_str())) {}
 }

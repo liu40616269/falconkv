@@ -19,7 +19,7 @@ std::string CreateTempFile(const std::string& suffix) {
     if (fd >= 0) {
         // Write some data so reads are valid.
         const char data[] = "hello falconkv";
-        write(fd, data, sizeof(data));
+        if (write(fd, data, sizeof(data))) {}
         close(fd);
     }
     return path;

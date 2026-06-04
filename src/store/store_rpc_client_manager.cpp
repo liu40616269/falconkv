@@ -1,5 +1,7 @@
 #include "src/store/store_rpc_client_manager.h"
 
+#include "src/common/logging.h"
+
 namespace falconkv {
 
 StoreRpcClientManager::~StoreRpcClientManager() {
@@ -26,6 +28,7 @@ StoreRpcClient* StoreRpcClientManager::GetOrCreate(const std::string& addr) {
     }
 
     auto* raw = client.get();
+    LOG(INFO) << "[StoreRpcClientManager] Created new StoreRpcClient for " << addr;
     clients_[addr] = std::move(client);
     return raw;
 }

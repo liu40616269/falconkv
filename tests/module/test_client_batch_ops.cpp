@@ -49,7 +49,7 @@ protected:
         client_->Close();
         store_->Close();
         std::string cmd = "rm -rf " + test_dir_;
-        system(cmd.c_str());
+        if (system(cmd.c_str())) {}
     }
 
     std::string test_dir_;
@@ -226,7 +226,7 @@ TEST_F(ClientBatchOpsTest, BatchPutNoSpace) {
     client.Close();
     tiny_store.Close();
     std::string cmd = "rm -rf " + tiny_dir;
-    system(cmd.c_str());
+    if (system(cmd.c_str())) {}
 }
 
 // ---------------------------------------------------------------------------

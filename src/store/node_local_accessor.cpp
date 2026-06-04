@@ -33,6 +33,8 @@ void NodeLocalAccessor::RegisterStoreFile(uint32_t store_id,
                                            const std::string& data_file) {
     std::lock_guard<std::mutex> lock(mutex_);
     store_files_[store_id] = data_file;
+    LOG(INFO) << "[NodeLocalAccessor] RegisterStoreFile: store_id=" << store_id
+              << ", data_file=" << data_file;
 }
 
 int NodeLocalAccessor::GetFd(uint32_t store_id) {

@@ -45,7 +45,7 @@ protected:
         store_.reset();
         // Clean up test directory.
         std::string cmd = "rm -rf " + test_dir_;
-        system(cmd.c_str());
+        if (system(cmd.c_str())) {}
     }
 
     std::string test_dir_;

@@ -4,12 +4,20 @@
 Usage:
     python perf_client.py --config perf_config.json --client-id A
 
-This script:
-1. Parses the shared perf config and extracts its own client section.
-2. Generates a FalconKV JSON config file for pyfalconkv.Client.
-3. Runs a warmup phase, then the main benchmark loop.
-4. Records per-operation latencies (exist / put / get).
-5. Computes percentile statistics and writes result_{client_id}.json.
+Architecture:
+    - Client A: writer + local reader   (ACCESS_LOCAL_DIRECT)
+    - Client B: same-node reader         (ACCESS_NODE_DIRECT)
+    - Client C: cross-node reader         (ACCESS_REMOTE_RPC)
+
+Key design:
+    - Client A is the sole writer. batch_idx increments continuously,
+      producing unlimited new keys (perf_A_{batch_idx}_{i}).
+    - Clients B/C only read, referencing A's previously written keys
+      (lag by 1 batch to ensure data has been synced to Meta).
+    - Before every write, batch_exist checks whether keys already exist
+      to avoid duplicate writes.
+    - capacity_gb in the config should be large enough to hold all data
+      written during warmup + benchmark (evict optimization pending).
 """
 
 import argparse
@@ -22,7 +30,7 @@ import time
 
 
 # ---------------------------------------------------------------------------
-# Buffer helpers (same pattern as integration tests)
+# Buffer helpers
 # ---------------------------------------------------------------------------
 
 class BufferGuard:
@@ -59,7 +67,8 @@ def _write_falconkv_config(client_cfg: dict, test_cfg: dict, config: dict,
     """Generate a FalconKV JSON config file and return its path."""
     meta_addr = config["transfer"]["meta_addr"]
     scheduler_enabled = config["scheduler"].get("enabled", False)
-    scheduler_uds = test_cfg.get("scheduler_uds_path", "/tmp/falconkv_perf_sched.sock")
+    scheduler_uds = test_cfg.get("scheduler_uds_path",
+                                  "/tmp/falconkv_perf_sched.sock")
 
     falconkv_cfg = {
         "common": {
@@ -72,7 +81,7 @@ def _write_falconkv_config(client_cfg: dict, test_cfg: dict, config: dict,
         "store": {
             "ssd_path": ssd_path,
             "store_id": client_cfg["store_id"],
-            "capacity_gb": client_cfg.get("capacity_gb", 1),
+            "capacity_gb": client_cfg.get("capacity_gb", 8),
             "page_size": 4096,
             "io_threads": client_cfg.get("io_threads", 2),
             "buffer_pool_size": client_cfg.get("buffer_pool_size", 4),
@@ -94,11 +103,34 @@ def _write_falconkv_config(client_cfg: dict, test_cfg: dict, config: dict,
 
 
 # ---------------------------------------------------------------------------
+# Key generation
+# ---------------------------------------------------------------------------
+
+def _generate_keys(role: str, client_id: str, batch_idx: int,
+                   batch_size: int) -> list:
+    """Generate keys for one batch iteration.
+
+    - Writer (A): produces fresh keys with the current batch_idx.
+    - Readers (B/C): reference A's *previous* batch to ensure the data
+      has already been written and synced to Meta.
+    """
+    keys = []
+    if role == "writer":
+        for i in range(batch_size):
+            keys.append(f"perf_A_{batch_idx}_{i}")
+    else:
+        # Lag behind A by 1 batch so the data is guaranteed to exist.
+        read_batch = max(0, batch_idx - 1)
+        for i in range(batch_size):
+            keys.append(f"perf_A_{read_batch}_{i}")
+    return keys
+
+
+# ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
 
 def _percentile(sorted_data: list, pct: float) -> float:
-    """Compute percentile from sorted list."""
     if not sorted_data:
         return 0.0
     k = (len(sorted_data) - 1) * pct / 100.0
@@ -113,7 +145,6 @@ def _percentile(sorted_data: list, pct: float) -> float:
 
 def _compute_stats(latencies_ms: list, elapsed_sec: float,
                    total_bytes: int) -> dict:
-    """Compute stats from a list of latencies in ms."""
     if not latencies_ms:
         return {
             "total_ops": 0,
@@ -135,46 +166,25 @@ def _compute_stats(latencies_ms: list, elapsed_sec: float,
         "p99_ms": round(_percentile(s, 99), 3),
         "min_ms": round(s[0], 3),
         "max_ms": round(s[-1], 3),
-        "throughput_ops": round(len(s) / elapsed_sec, 1) if elapsed_sec > 0 else 0.0,
+        "throughput_ops": round(len(s) / elapsed_sec, 1)
+        if elapsed_sec > 0 else 0.0,
         "throughput_mb": round(total_bytes / (1024 * 1024) / elapsed_sec, 2)
         if elapsed_sec > 0 else 0.0,
     }
 
 
 # ---------------------------------------------------------------------------
-# Key generation
+# Determine client role
 # ---------------------------------------------------------------------------
 
-def _generate_keys(client_id: str, batch_idx: int, batch_size: int,
-                   shared_ratio: float, shared_batch_idx: int = -1):
-    """Generate a mix of shared and exclusive keys for one batch.
-
-    Returns (keys, is_shared_mask) where is_shared_mask[i] is True if the key
-    is a shared key written by Client A.
-
-    shared_batch_idx controls which batch index is used for shared keys.
-    When -1 (default), shared keys use batch_idx (same as exclusive keys).
-    """
-    keys = []
-    shared_mask = []
-    n_shared = max(1, int(batch_size * shared_ratio))
-    n_exclusive = batch_size - n_shared
-
-    # Use shared_batch_idx for shared keys if provided, else batch_idx
-    sidx = shared_batch_idx if shared_batch_idx >= 0 else batch_idx
-
-    # Shared keys — these are written by Client A (store_id=1, node_id=1)
-    # Other clients only read them (triggering cross-store / cross-node paths)
-    for i in range(n_shared):
-        keys.append(f"perf_shared_{sidx}_{i}")
-        shared_mask.append(True)
-
-    # Exclusive keys — owned by this client
-    for i in range(n_exclusive):
-        keys.append(f"perf_{client_id}_{batch_idx}_{i}")
-        shared_mask.append(False)
-
-    return keys, shared_mask
+def _get_role(client_id: str, client_cfg: dict, config: dict) -> str:
+    """Return the benchmark role for this client."""
+    if client_id == "A":
+        return "writer"
+    writer_cfg = _find_client_config(config, "A")
+    if client_cfg["node_id"] == writer_cfg["node_id"]:
+        return "same_node_reader"
+    return "cross_node_reader"
 
 
 # ---------------------------------------------------------------------------
@@ -190,58 +200,69 @@ def run_benchmark(config: dict, client_id: str):
     ssd_path = client_cfg["ssd_path"]
     os.makedirs(ssd_path, exist_ok=True)
 
-    # Generate FalconKV config
     config_path = _write_falconkv_config(client_cfg, test_cfg, config, ssd_path)
+    client = Client(config_path,
+                    cache_capacity=client_cfg.get("cache_capacity", 100000))
 
-    # Create client
-    client = Client(config_path, cache_capacity=client_cfg.get("cache_capacity", 100000))
-
-    batch_size = test_cfg.get("batch_size", 8)
+    batch_size = test_cfg.get("batch_size", 16)
     value_size = test_cfg.get("value_size", 4096)
-    shared_ratio = test_cfg.get("shared_key_ratio", 0.3)
-    warmup_sec = test_cfg.get("warmup_sec", 3)
+    warmup_sec = test_cfg.get("warmup_sec", 10)
     duration_sec = test_cfg.get("duration_sec", 30)
+    capacity_gb = client_cfg.get("capacity_gb", 8)
 
-    # ---- Warmup phase ----
-    print(f"[{client_id}] Warmup: writing initial data for {warmup_sec}s ...")
-    warmup_data = os.urandom(value_size)
-    warmup_guard = BufferGuard(warmup_data)
-    warmup_batch_count = 0
-    warmup_end = time.time() + warmup_sec
-    while time.time() < warmup_end:
-        keys, shared_mask = _generate_keys(client_id, warmup_batch_count,
-                                           batch_size, shared_ratio)
-        # Only Client A writes shared keys; others just write their exclusives
-        if client_id == "A":
-            put_keys = keys
-            put_ptrs = [warmup_guard.ptr] * len(keys)
-            put_sizes = [warmup_guard.size] * len(keys)
-        else:
-            put_keys = [k for k, s in zip(keys, shared_mask) if not s]
-            put_ptrs = [warmup_guard.ptr] * len(put_keys)
-            put_sizes = [warmup_guard.size] * len(put_keys)
+    role = _get_role(client_id, client_cfg, config)
 
-        if put_keys:
-            client.batch_put_sync(put_keys, put_ptrs, put_sizes)
-        warmup_batch_count += 1
+    print(f"[{client_id}] role={role}  batch_size={batch_size}  "
+          f"value_size={value_size}  capacity_gb={capacity_gb}")
 
-    # Wait for meta sync across all clients
-    print(f"[{client_id}] Warmup done ({warmup_batch_count} batches). "
-          f"Waiting for meta sync ...")
+    # ---- Warmup phase -------------------------------------------------------
+    if role == "writer":
+        # Client A writes continuously to populate data for B/C to read.
+        print(f"[A] Warmup: writing initial data for {warmup_sec}s ...")
+        warmup_data = os.urandom(value_size)
+        warmup_guard = BufferGuard(warmup_data)
+        warmup_batch_count = 0
+        warmup_end = time.time() + warmup_sec
+
+        while time.time() < warmup_end:
+            keys = _generate_keys(role, client_id,
+                                  warmup_batch_count, batch_size)
+            # Check existence before writing to avoid duplicates
+            hit_count = client.batch_exist_sync(keys)
+            if hit_count < len(keys):
+                client.batch_put_sync(
+                    keys,
+                    [warmup_guard.ptr] * len(keys),
+                    [warmup_guard.size] * len(keys),
+                )
+            warmup_batch_count += 1
+
+        print(f"[A] Warmup done ({warmup_batch_count} batches).")
+    else:
+        # B / C simply wait for A to finish populating data.
+        print(f"[{client_id}] Warmup: waiting {warmup_sec}s "
+              f"for Client A to write data ...")
+        time.sleep(warmup_sec)
+
+    # Allow meta sync to propagate across clients.
+    print(f"[{client_id}] Waiting for meta sync ...")
     time.sleep(2)
 
-    # ---- Main benchmark ----
+    # ---- Main benchmark -----------------------------------------------------
     exist_latencies = []
     put_latencies = []
     get_latencies = []
     put_bytes = 0
     get_bytes = 0
     errors = 0
-    # Reset batch_idx to 0 so that all clients reference the same shared-key
-    # range written by Client A during warmup.  Using warmup_batch_count would
-    # break because each client completes a different number of warmup batches
-    # (Client A writes all keys; others write only exclusives), causing the
-    # shared-batch offset to point to keys that were never written.
+    put_skip_count = 0   # batches where all keys already existed
+    put_exec_count = 0   # batches where put was actually called
+    get_hit_count = 0    # keys successfully read
+    get_miss_count = 0   # keys not found / failed
+
+    # Reset batch_idx to 0 so that all readers reference the same key
+    # range written by Client A during warmup.  Using warmup_batch_count
+    # would break because each client has a different warmup trajectory.
     batch_idx = 0
 
     print(f"[{client_id}] Running benchmark for {duration_sec}s ...")
@@ -249,46 +270,45 @@ def run_benchmark(config: dict, client_id: str):
     deadline = t_start + duration_sec
 
     while time.time() < deadline:
-        # Non-A clients reference the previous batch's shared keys (written by A)
-        shared_batch = batch_idx if client_id == "A" else max(0, batch_idx - 1)
-        keys, shared_mask = _generate_keys(client_id, batch_idx,
-                                           batch_size, shared_ratio,
-                                           shared_batch_idx=shared_batch)
+        keys = _generate_keys(role, client_id, batch_idx, batch_size)
 
-        # 1) batch_exist
+        # 1) batch_exist — all clients
         t0 = time.monotonic()
         try:
-            client.batch_exist_sync(keys)
-        except Exception as e:
+            hit_count = client.batch_exist_sync(keys)
+        except Exception:
             errors += 1
+            hit_count = 0
         t1 = time.monotonic()
         exist_latencies.append((t1 - t0) * 1000)
 
-        # 2) batch_put — only put keys this client owns
-        if client_id == "A":
-            put_keys = keys
-        else:
-            put_keys = [k for k, s in zip(keys, shared_mask) if not s]
+        # 2) batch_put — Client A only, conditional on existence
+        if role == "writer":
+            if hit_count < len(keys):
+                # At least one key is new — attempt to write.
+                # The store internally skips keys that already exist, so
+                # it is safe to pass the full batch.
+                write_data = os.urandom(value_size)
+                write_guard = BufferGuard(write_data)
 
-        if put_keys:
-            write_data = os.urandom(value_size)
-            write_guard = BufferGuard(write_data)
-            put_ptrs = [write_guard.ptr] * len(put_keys)
-            put_sizes = [write_guard.size] * len(put_keys)
+                t0 = time.monotonic()
+                try:
+                    client.batch_put_sync(
+                        keys,
+                        [write_guard.ptr] * len(keys),
+                        [write_guard.size] * len(keys),
+                    )
+                    put_bytes += value_size * (len(keys) - hit_count)
+                    put_exec_count += 1
+                except Exception:
+                    errors += 1
+                t1 = time.monotonic()
+                put_latencies.append((t1 - t0) * 1000)
+            else:
+                put_skip_count += 1
 
-            t0 = time.monotonic()
-            try:
-                client.batch_put_sync(put_keys, put_ptrs, put_sizes)
-                put_bytes += value_size * len(put_keys)
-            except Exception as e:
-                errors += 1
-            t1 = time.monotonic()
-            put_latencies.append((t1 - t0) * 1000)
-
-        # 3) batch_get — read all keys (triggers cross-store/cross-node for shared)
-        get_buffers = []
-        for k in keys:
-            get_buffers.append(ZeroBuffer(value_size))
+        # 3) batch_get — all clients read the same keys
+        get_buffers = [ZeroBuffer(value_size) for _ in keys]
 
         t0 = time.monotonic()
         try:
@@ -297,8 +317,13 @@ def run_benchmark(config: dict, client_id: str):
                 [b.ptr for b in get_buffers],
                 [b.size for b in get_buffers],
             )
-            get_bytes += sum(max(0, r) for r in results)
-        except Exception as e:
+            for r in results:
+                if r > 0:
+                    get_bytes += r
+                    get_hit_count += 1
+                else:
+                    get_miss_count += 1
+        except Exception:
             errors += 1
         t1 = time.monotonic()
         get_latencies.append((t1 - t0) * 1000)
@@ -307,25 +332,28 @@ def run_benchmark(config: dict, client_id: str):
 
     elapsed = time.time() - t_start
 
-    # Compute stats
+    # ---- Compute statistics --------------------------------------------------
     result = {
         "client_id": client_id,
+        "role": role,
         "node_id": client_cfg["node_id"],
         "store_id": client_cfg["store_id"],
         "elapsed_sec": round(elapsed, 2),
         "config": {
             "batch_size": batch_size,
             "value_size": value_size,
-            "shared_key_ratio": shared_ratio,
         },
         "exist": _compute_stats(exist_latencies, elapsed, 0),
         "put": _compute_stats(put_latencies, elapsed, put_bytes),
         "get": _compute_stats(get_latencies, elapsed, get_bytes),
+        "put_exec_count": put_exec_count,
+        "put_skip_count": put_skip_count,
+        "get_hit_count": get_hit_count,
+        "get_miss_count": get_miss_count,
         "errors": errors,
         "total_batches": batch_idx,
     }
 
-    # Write result file
     result_dir = test_cfg.get("result_dir", "/tmp/falconkv_perf_result")
     os.makedirs(result_dir, exist_ok=True)
     result_path = os.path.join(result_dir, f"result_{client_id}.json")
@@ -333,7 +361,10 @@ def run_benchmark(config: dict, client_id: str):
         json.dump(result, f, indent=2)
 
     print(f"[{client_id}] Done. {result['total_batches']} batches, "
-          f"{errors} errors. Results → {result_path}")
+          f"{errors} errors. Results -> {result_path}")
+    if role == "writer":
+        print(f"[A] put_exec={put_exec_count}  put_skip={put_skip_count}")
+    print(f"[{client_id}] get_hit={get_hit_count}  get_miss={get_miss_count}")
 
     client.close()
     return result
@@ -357,7 +388,6 @@ def main():
 
     result = run_benchmark(config, args.client_id)
 
-    # Print brief summary
     for op in ("exist", "put", "get"):
         s = result[op]
         print(f"  {op:5s}: {s['total_ops']:5d} ops  "

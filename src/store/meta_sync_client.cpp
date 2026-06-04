@@ -37,6 +37,7 @@ Status MetaSyncClient::TryConnect() {
     channel_ = std::move(new_channel);
     stub_ = std::make_unique<FalconKVMetaService_Stub>(channel_.get());
     connected_.store(true);
+    LOG(INFO) << "[MetaSyncClient] Connected to Meta at " << meta_addr_;
     return Status::OK();
 }
 
@@ -52,6 +53,7 @@ Status MetaSyncClient::Connect(const std::string& meta_addr) {
         LOG(WARNING) << "[MetaSyncClient] Connect failed: " << s.ToString()
                      << " (will retry later)";
     } else {
+        LOG(INFO) << "[MetaSyncClient] Initial connect succeeded to Meta at " << meta_addr_;
         FullResync();
     }
     return Status::OK();
@@ -206,6 +208,8 @@ Status MetaSyncClient::RegisterStore(uint32_t store_id, uint32_t node_id,
                                   response.error_msg());
     }
 
+    LOG(INFO) << "[MetaSyncClient] RegisterStore succeeded: store_id=" << store_id
+              << ", node_id=" << node_id << ", data_file=" << data_file;
     return Status::OK();
 }
 

@@ -37,6 +37,7 @@ Status MetaRpcClient::TryConnect() {
     channel_ = std::move(new_channel);
     stub_ = std::make_unique<FalconKVMetaService_Stub>(channel_.get());
     connected_.store(true);
+    LOG(INFO) << "[MetaRpcClient] Connected to Meta at " << meta_addr_;
     return Status::OK();
 }
 

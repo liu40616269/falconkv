@@ -28,7 +28,7 @@ protected:
 
     void TearDown() override {
         std::string cmd = "rm -rf " + test_dir_;
-        system(cmd.c_str());
+        if (system(cmd.c_str())) {}
     }
 
     FalconKVStore::Config MakeConfig() {

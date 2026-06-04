@@ -1,5 +1,7 @@
 #include "src/store/store_server.h"
 
+#include "src/common/logging.h"
+
 namespace falconkv {
 
 StoreServer::StoreServer(const FalconKVStore::Config& store_config,
@@ -34,6 +36,7 @@ Status StoreServer::Start() {
                                 listen_addr_);
     }
 
+    LOG(INFO) << "[StoreServer] Started on " << listen_addr_;
     return Status::OK();
 }
 

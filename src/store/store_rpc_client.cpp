@@ -33,6 +33,7 @@ Status StoreRpcClient::Connect(const std::string& addr) {
 
     stub_ = std::make_unique<FalconKVStoreService_Stub>(&channel_);
     connected_ = true;
+    LOG(INFO) << "[StoreRpcClient] Connected to store at " << addr;
     return Status::OK();
 }
 

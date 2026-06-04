@@ -3,6 +3,8 @@
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
 
+#include "src/common/logging.h"
+
 namespace falconkv {
 
 MetaServiceImpl::MetaServiceImpl(MetaManager* meta_manager)
@@ -98,6 +100,10 @@ void MetaServiceImpl::StoreRegister(::google::protobuf::RpcController*,
     info.data_file = request->data_file();
 
     Status status = meta_manager_->RegisterStore(info);
+    if (status.ok()) {
+        LOG(INFO) << "[MetaServiceImpl] StoreRegister: store_id=" << info.store_id
+                  << ", node_id=" << info.node_id << ", addr=" << info.store_addr;
+    }
     response->set_status(status.ok() ? 0 : static_cast<int>(status.code()));
     if (!status.ok()) {
         response->set_error_msg(status.msg());

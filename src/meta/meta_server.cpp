@@ -1,5 +1,7 @@
 #include "src/meta/meta_server.h"
 
+#include "src/common/logging.h"
+
 namespace falconkv {
 
 MetaServer::MetaServer(const MetaConfig& config)
@@ -27,6 +29,7 @@ Status MetaServer::Start() {
                                 listen_addr_);
     }
 
+    LOG(INFO) << "[MetaServer] Started on " << listen_addr_;
     return Status::OK();
 }
 

@@ -100,5 +100,5 @@ TEST(FileNaming, FallocatePreallocation) {
 
     store.Close();
     std::string cmd = "rm -rf " + tmp_dir;
-    system(cmd.c_str());
+    if (system(cmd.c_str())) {}
 }

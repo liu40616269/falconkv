@@ -23,6 +23,7 @@ std::unique_ptr<TransferChannel> TransferManager::CreateChannel(const std::strin
                    << ": " << s.ToString();
         return nullptr;
     }
+    LOG(INFO) << "[TransferManager] Created channel to " << addr;
     return channel;
 }
 
@@ -44,6 +45,7 @@ TransferChannel* TransferManager::GetMetaChannel() {
         return nullptr;
     }
 
+    LOG(INFO) << "[TransferManager] GetMetaChannel: connected to meta at " << config_.meta_addr;
     meta_channel_ = std::move(channel);
     return meta_channel_.get();
 }
@@ -72,6 +74,8 @@ TransferChannel* TransferManager::GetStoreChannel(uint32_t store_id) {
         return nullptr;
     }
 
+    LOG(INFO) << "[TransferManager] GetStoreChannel: created new channel to store "
+              << store_id << " at " << addr_it->second;
     pool.push_back(std::move(channel));
     return pool.back().get();
 }
@@ -92,6 +96,7 @@ std::vector<TransferChannel*> TransferManager::GetStoreChannels(
 void TransferManager::RegisterStoreAddr(uint32_t store_id, const std::string& addr) {
     std::lock_guard<std::mutex> lock(store_mutex_);
     store_addrs_[store_id] = addr;
+    LOG(INFO) << "[TransferManager] RegisterStoreAddr: store_id=" << store_id << ", addr=" << addr;
 }
 
 void TransferManager::CloseAll() {

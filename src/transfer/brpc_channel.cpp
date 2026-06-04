@@ -94,6 +94,7 @@ Status BrpcChannel::Connect(const std::string& addr) {
     }
 
     impl_->connected = true;
+    LOG(INFO) << "[BrpcChannel] Connected to " << addr;
     return Status::OK();
 }
 
