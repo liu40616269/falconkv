@@ -86,6 +86,7 @@ void ApplyEnvOverrides(FalconKVConfig& config) {
     config.store.direct_io_enabled = GetEnvOrDefault("FALCONKV_DIRECT_IO_ENABLED", config.store.direct_io_enabled ? "1" : "0") == "1";
     config.store.io_uring_queue_depth = GetEnvOrDefaultUInt("FALCONKV_IO_URING_QUEUE_DEPTH", config.store.io_uring_queue_depth);
     config.store.slot_size_bytes = GetEnvOrDefaultUInt("FALCONKV_SLOT_SIZE_BYTES", config.store.slot_size_bytes);
+    config.store.hixl_engine_addr = GetEnvOrDefault("FALCONKV_STORE_HIXL_ENGINE_ADDR", config.store.hixl_engine_addr);
 
     // Scheduler config overrides
     config.scheduler.uds_path = GetEnvOrDefault("FALCONKV_SCHED_UDS_PATH", config.scheduler.uds_path);
@@ -102,6 +103,11 @@ void ApplyEnvOverrides(FalconKVConfig& config) {
 
     // Transfer config overrides
     config.transfer.protocol = GetEnvOrDefault("FALCONKV_TRANSFER_PROTOCOL", config.transfer.protocol);
+    config.transfer.data_protocol = GetEnvOrDefault("FALCONKV_TRANSFER_DATA_PROTOCOL", config.transfer.data_protocol);
+    config.transfer.hixl_fallback_to_brpc = GetEnvOrDefault("FALCONKV_HIXL_FALLBACK_TO_BRPC",
+                                                            config.transfer.hixl_fallback_to_brpc ? "1" : "0") == "1";
+    config.transfer.hixl_local_engine = GetEnvOrDefault("FALCONKV_HIXL_LOCAL_ENGINE", config.transfer.hixl_local_engine);
+    config.transfer.hixl_timeout_ms = GetEnvOrDefaultInt("FALCONKV_HIXL_TIMEOUT_MS", config.transfer.hixl_timeout_ms);
     config.transfer.meta_addr = GetEnvOrDefault("FALCONKV_TRANSFER_META_ADDR", config.transfer.meta_addr);
     config.transfer.meta_pool_size = GetEnvOrDefaultInt("FALCONKV_META_POOL_SIZE", config.transfer.meta_pool_size);
     config.transfer.store_pool_size = GetEnvOrDefaultInt("FALCONKV_STORE_POOL_SIZE", config.transfer.store_pool_size);
@@ -173,6 +179,7 @@ void ParseStoreConfig(const Json::Value& root, StoreConfig& cfg) {
     if (s.isMember("direct_io_enabled"))      cfg.direct_io_enabled = s["direct_io_enabled"].asBool();
     if (s.isMember("io_uring_queue_depth"))   cfg.io_uring_queue_depth = s["io_uring_queue_depth"].asUInt();
     if (s.isMember("slot_size_bytes"))        cfg.slot_size_bytes = s["slot_size_bytes"].asUInt();
+    if (s.isMember("hixl_engine_addr"))       cfg.hixl_engine_addr = s["hixl_engine_addr"].asString();
 }
 
 void ParseSchedulerConfig(const Json::Value& root, SchedulerConfig& cfg) {
@@ -198,6 +205,10 @@ void ParseTransferConfig(const Json::Value& root, TransferConfig& cfg) {
     if (!root.isMember("transfer")) return;
     const auto& t = root["transfer"];
     if (t.isMember("protocol"))           cfg.protocol = t["protocol"].asString();
+    if (t.isMember("data_protocol"))      cfg.data_protocol = t["data_protocol"].asString();
+    if (t.isMember("hixl_fallback_to_brpc")) cfg.hixl_fallback_to_brpc = t["hixl_fallback_to_brpc"].asBool();
+    if (t.isMember("hixl_local_engine"))  cfg.hixl_local_engine = t["hixl_local_engine"].asString();
+    if (t.isMember("hixl_timeout_ms"))    cfg.hixl_timeout_ms = t["hixl_timeout_ms"].asInt();
     if (t.isMember("meta_pool_size"))     cfg.meta_pool_size = t["meta_pool_size"].asInt();
     if (t.isMember("store_pool_size"))    cfg.store_pool_size = t["store_pool_size"].asInt();
     if (t.isMember("rpc_timeout_ms"))     cfg.rpc_timeout_ms = t["rpc_timeout_ms"].asInt();

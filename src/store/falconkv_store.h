@@ -82,6 +82,7 @@ public:
         bool direct_io_enabled = true;
         uint32_t io_uring_queue_depth = 128;
         uint32_t slot_size_bytes = 0;  // 0 = auto-detect from first write
+        std::string hixl_engine_addr = "";
 
         static Config FromStoreConfig(const StoreConfig& sc);
     };
@@ -116,6 +117,7 @@ public:
     uint32_t node_id() const { return config_.node_id; }
     const std::string& data_file() const { return data_file_; }
     SchedulerProxy* scheduler_proxy() const { return scheduler_proxy_.get(); }
+    const std::string& hixl_engine_addr() const { return config_.hixl_engine_addr; }
 
 private:
     Status InitDataFile();

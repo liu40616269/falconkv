@@ -158,6 +158,65 @@ Status StoreRpcClient::BatchRead(const std::vector<uint64_t>& offsets,
     return Status::OK();
 }
 
+Status StoreRpcClient::PrepareHixlBatchRead(
+    const std::vector<uint64_t>& offsets,
+    const std::vector<uint32_t>& sizes,
+    uint32_t client_id,
+    const std::string& source_node_addr,
+    HixlBatchReadResponse* response) {
+    if (!connected_) {
+        LOG(ERROR) << "[StoreRpcClient] PrepareHixlBatchRead: not connected";
+        return Status::RpcError("not connected");
+    }
+    if (!response) {
+        return Status::InvalidArg("PrepareHixlBatchRead response is null");
+    }
+    if (offsets.size() != sizes.size()) {
+        return Status::InvalidArg("PrepareHixlBatchRead parameter size mismatch");
+    }
+
+    HixlBatchReadRequest request;
+    request.set_client_id(client_id);
+    request.set_source_node_addr(source_node_addr);
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        auto* seg = request.add_segments();
+        seg->set_offset(offsets[i]);
+        seg->set_size(sizes[i]);
+    }
+
+    brpc::Controller cntl;
+    stub_->PrepareHixlBatchRead(&cntl, &request, response, nullptr);
+    if (cntl.Failed()) {
+        return Status::RpcError("PrepareHixlBatchRead RPC failed: " +
+                                std::string(cntl.ErrorText()));
+    }
+    if (response->status() != 0) {
+        return Status::RpcError("PrepareHixlBatchRead failed with status: " +
+                                std::to_string(response->status()));
+    }
+    return Status::OK();
+}
+
+Status StoreRpcClient::ReleaseHixlRead(const std::string& token) {
+    if (!connected_) {
+        return Status::RpcError("not connected");
+    }
+    HixlReleaseRequest request;
+    request.set_token(token);
+    HixlReleaseResponse response;
+    brpc::Controller cntl;
+    stub_->ReleaseHixlRead(&cntl, &request, &response, nullptr);
+    if (cntl.Failed()) {
+        return Status::RpcError("ReleaseHixlRead RPC failed: " +
+                                std::string(cntl.ErrorText()));
+    }
+    if (response.status() != 0) {
+        return Status::RpcError("ReleaseHixlRead failed with status: " +
+                                std::to_string(response.status()));
+    }
+    return Status::OK();
+}
+
 Status StoreRpcClient::Ping() {
     if (!connected_) {
         LOG(ERROR) << "[StoreRpcClient] Ping: not connected";

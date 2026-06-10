@@ -61,6 +61,14 @@ FalconKVClientImpl::FalconKVClientImpl(const Config& config)
     // Start background reconnect loop for Meta RPC client.
     meta_client_.StartReconnectLoop(5);
 
+    transfer_config_ = cfg.transfer;
+    remote_read_backend_ = CreateRemoteReadBackend(&store_rpc_mgr_,
+                                                   transfer_config_);
+    LOG(INFO) << "[FalconKVClient] Remote read data protocol="
+              << transfer_config_.data_protocol
+              << ", fallback_to_brpc="
+              << (transfer_config_.hixl_fallback_to_brpc ? "true" : "false");
+
     // Initialize NodeLocalAccessor IO engines for batch NODE_DIRECT reads
     NodeLocalAccessor::Config nla_cfg;
     nla_cfg.page_size = cfg.store.page_size;
@@ -94,15 +102,32 @@ Status FalconKVClientImpl::DoRead(const KeyDescriptor& desc,
                                         buffer, size);
 
         case AccessType::ACCESS_REMOTE_RPC: {
-            StoreRpcClient* rpc = GetStoreRpcClient(desc.store_id);
-            if (!rpc) {
+            std::string store_addr = RemoteAddrForDesc(desc);
+            if (store_addr.empty()) {
                 LOG(ERROR) << "[FalconKVClient] DoRead: no RPC client for store "
                            << desc.store_id << ", key=" << desc.key;
                 return Status::RpcError(
                     "no RPC client for store " + std::to_string(desc.store_id));
             }
-            return rpc->Read(desc.offset, buffer, size,
-                             node_id_, local_store_addr_);
+
+            RemoteReadRequest request;
+            request.store_id = desc.store_id;
+            request.store_addr = store_addr;
+            request.client_id = node_id_;
+            request.source_node_addr = local_store_addr_;
+            request.offsets = {desc.offset};
+            request.sizes = {size};
+            request.buffers = {buffer};
+
+            std::vector<int32_t> results;
+            Status s = remote_read_backend_->BatchRead(request, results);
+            if (!s.ok()) {
+                return s;
+            }
+            if (results.empty() || results[0] <= 0) {
+                return Status::IoError("remote read returned no data");
+            }
+            return Status::OK();
         }
 
         default:
@@ -448,8 +473,8 @@ std::vector<int32_t> FalconKVClientImpl::BatchGet(
         }
 
         for (auto& [sid, indices] : rpc_groups) {
-            StoreRpcClient* rpc = GetStoreRpcClient(sid);
-            if (!rpc) {
+            std::string remote_addr = RemoteAddrForDesc(key_descs[indices[0]]);
+            if (remote_addr.empty()) {
                 LOG(ERROR) << "[BatchGet] No RPC client for store " << sid
                            << ", failing " << indices.size() << " keys";
                 for (size_t idx : indices) {
@@ -475,7 +500,6 @@ std::vector<int32_t> FalconKVClientImpl::BatchGet(
             // Scheduler: RequestIO for batch RPC read
             uint64_t request_ts = GetCurrentTimeNs();
             IOResponseData io_resp;
-            std::string remote_addr = RemoteAddrForDesc(key_descs[indices[0]]);
             if (scheduler_enabled_) {
                 IORequestData io_req;
                 io_req.io_channel = 2;  // NET_TX_READ
@@ -488,7 +512,16 @@ std::vector<int32_t> FalconKVClientImpl::BatchGet(
 
             uint64_t start_ts = GetCurrentTimeNs();
             std::vector<int32_t> rpc_results;
-            Status batch_status = rpc->BatchRead(offsets, seg_sizes, seg_bufs, rpc_results);
+            RemoteReadRequest request;
+            request.store_id = sid;
+            request.store_addr = remote_addr;
+            request.client_id = node_id_;
+            request.source_node_addr = local_store_addr_;
+            request.offsets = std::move(offsets);
+            request.sizes = std::move(seg_sizes);
+            request.buffers = std::move(seg_bufs);
+            Status batch_status = remote_read_backend_->BatchRead(request,
+                                                                  rpc_results);
             uint64_t done_ts = GetCurrentTimeNs();
 
             if (!batch_status.ok()) {

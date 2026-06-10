@@ -1,6 +1,7 @@
 # Client library
 add_library(falconkv_client STATIC
     key_desc_cache.cpp
+    remote_read_backend.cpp
     falconkv_client_impl.cpp
 )
 
@@ -20,4 +21,10 @@ target_link_libraries(falconkv_client PUBLIC
 
 if(FALCONKV_HAS_BRPC)
     target_link_libraries(falconkv_client PUBLIC falconkv_brpc_deps)
+endif()
+
+if(FALCONKV_HAS_HIXL)
+    target_compile_definitions(falconkv_client PUBLIC FALCONKV_HAS_HIXL)
+    target_include_directories(falconkv_client PUBLIC ${HIXL_INCLUDE_DIR})
+    target_link_libraries(falconkv_client PUBLIC ${HIXL_LIBRARY})
 endif()

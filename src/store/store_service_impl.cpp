@@ -5,6 +5,8 @@
 #include <brpc/controller.h>
 
 #include <cstring>
+#include <map>
+#include <sstream>
 #include <unordered_map>
 #include "src/common/time_util.h"
 
@@ -12,6 +14,52 @@ namespace falconkv {
 
 StoreServiceImpl::StoreServiceImpl(FalconKVStore* store)
     : store_(store) {}
+
+StoreServiceImpl::~StoreServiceImpl() {
+#ifdef FALCONKV_HAS_HIXL
+    std::lock_guard<std::mutex> lock(hixl_mutex_);
+    for (auto& item : hixl_leases_) {
+        for (auto handle : item.second.handles) {
+            if (hixl_engine_) {
+                hixl_engine_->DeregisterMem(handle);
+            }
+        }
+        for (void* buf : item.second.buffers) {
+            AlignedAllocator::Free(buf);
+        }
+    }
+    hixl_leases_.clear();
+    if (hixl_engine_) {
+        hixl_engine_->Finalize();
+    }
+#endif
+}
+
+#ifdef FALCONKV_HAS_HIXL
+Status StoreServiceImpl::EnsureHixlInitialized() {
+    if (hixl_initialized_) {
+        return Status::OK();
+    }
+    if (!store_ || store_->hixl_engine_addr().empty()) {
+        return Status::InvalidArg("store hixl_engine_addr is empty");
+    }
+
+    hixl_engine_ = std::make_unique<hixl::Hixl>();
+    std::map<hixl::AscendString, hixl::AscendString> options;
+    hixl::Status ret = hixl_engine_->Initialize(store_->hixl_engine_addr().c_str(),
+                                                options);
+    if (ret != hixl::SUCCESS) {
+        hixl_engine_.reset();
+        return Status::RpcError("HIXL Initialize failed: " +
+                                std::to_string(ret));
+    }
+
+    hixl_initialized_ = true;
+    LOG(INFO) << "[StoreServiceImpl] HIXL initialized at "
+              << store_->hixl_engine_addr();
+    return Status::OK();
+}
+#endif
 
 // -----------------------------------------------------------------
 // Read (offset-based, for remote client backward compatibility)
@@ -131,6 +179,153 @@ void StoreServiceImpl::BatchRead(::google::protobuf::RpcController* controller,
         cntl->response_attachment().append_user_data(
             buffers[i].release(), items[i].size, AlignedAllocator::Free);
     }
+}
+
+// -----------------------------------------------------------------
+// PrepareHixlBatchRead
+// -----------------------------------------------------------------
+void StoreServiceImpl::PrepareHixlBatchRead(::google::protobuf::RpcController*,
+                                             const HixlBatchReadRequest* request,
+                                             HixlBatchReadResponse* response,
+                                             ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+#ifndef FALCONKV_HAS_HIXL
+    response->set_status(static_cast<int>(Status::kNotSupported));
+    return;
+#else
+    {
+        std::lock_guard<std::mutex> lock(hixl_mutex_);
+        Status init = EnsureHixlInitialized();
+        if (!init.ok()) {
+            response->set_status(static_cast<int>(init.code()));
+            return;
+        }
+    }
+
+    std::vector<ReadItem> items;
+    HixlReadLease lease;
+    items.reserve(request->segments_size());
+    lease.buffers.reserve(request->segments_size());
+    lease.handles.reserve(request->segments_size());
+
+    for (int i = 0; i < request->segments_size(); ++i) {
+        const auto& seg = request->segments(i);
+        void* buf = AlignedAllocator::Allocate(512, seg.size());
+        if (!buf) {
+            response->set_status(-1);
+            for (void* allocated : lease.buffers) {
+                AlignedAllocator::Free(allocated);
+            }
+            return;
+        }
+        lease.buffers.push_back(buf);
+        items.push_back({seg.offset(), buf, seg.size()});
+    }
+
+    uint64_t total_io_size = 0;
+    for (const auto& item : items) total_io_size += item.size;
+
+    uint64_t request_ts_ns = GetCurrentTimeNs();
+    Status s = store_->BatchRead(items);
+    uint64_t done_ts_ns = GetCurrentTimeNs();
+
+    if (store_->scheduler_proxy() && s.ok()) {
+        store_->scheduler_proxy()->StoreReportIOAsync(
+            store_->store_id(),
+            3,  // NET_RX_READ
+            request->client_id(),
+            total_io_size,
+            request_ts_ns,
+            done_ts_ns,
+            request->source_node_addr());
+    }
+
+    if (!s.ok()) {
+        response->set_status(static_cast<int>(s.code()));
+        for (void* buf : lease.buffers) {
+            AlignedAllocator::Free(buf);
+        }
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(hixl_mutex_);
+        for (const auto& item : items) {
+            hixl::MemDesc desc{reinterpret_cast<uintptr_t>(item.buffer),
+                               item.size};
+            hixl::MemHandle handle = nullptr;
+            hixl::Status ret = hixl_engine_->RegisterMem(desc, hixl::MEM_HOST,
+                                                         handle);
+            if (ret != hixl::SUCCESS) {
+                for (auto registered : lease.handles) {
+                    hixl_engine_->DeregisterMem(registered);
+                }
+                for (void* buf : lease.buffers) {
+                    AlignedAllocator::Free(buf);
+                }
+                response->set_status(static_cast<int>(Status::kRpcError));
+                return;
+            }
+            lease.handles.push_back(handle);
+        }
+
+        std::ostringstream token;
+        token << store_->store_id() << "-" << hixl_next_token_.fetch_add(1);
+        response->set_status(0);
+        response->set_token(token.str());
+        response->set_remote_engine(store_->hixl_engine_addr());
+
+        for (const auto& item : items) {
+            auto* seg = response->add_segments();
+            seg->set_remote_addr(reinterpret_cast<uintptr_t>(item.buffer));
+            seg->set_size(item.size);
+            seg->set_status(0);
+        }
+
+        hixl_leases_.emplace(token.str(), std::move(lease));
+    }
+#endif
+}
+
+// -----------------------------------------------------------------
+// ReleaseHixlRead
+// -----------------------------------------------------------------
+void StoreServiceImpl::ReleaseHixlRead(::google::protobuf::RpcController*,
+                                        const HixlReleaseRequest* request,
+                                        HixlReleaseResponse* response,
+                                        ::google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+#ifndef FALCONKV_HAS_HIXL
+    response->set_status(0);
+    return;
+#else
+    HixlReadLease lease;
+    {
+        std::lock_guard<std::mutex> lock(hixl_mutex_);
+        auto it = hixl_leases_.find(request->token());
+        if (it == hixl_leases_.end()) {
+            response->set_status(static_cast<int>(Status::kNotFound));
+            return;
+        }
+        lease = std::move(it->second);
+        hixl_leases_.erase(it);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(hixl_mutex_);
+        if (hixl_engine_) {
+            for (auto handle : lease.handles) {
+                hixl_engine_->DeregisterMem(handle);
+            }
+        }
+    }
+    for (void* buf : lease.buffers) {
+        AlignedAllocator::Free(buf);
+    }
+    response->set_status(0);
+#endif
 }
 
 // -----------------------------------------------------------------

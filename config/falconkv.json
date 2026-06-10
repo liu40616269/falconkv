@@ -32,7 +32,8 @@
         "io_uring_enabled": true,
         "direct_io_enabled": true,
         "io_uring_queue_depth": 128,
-        "slot_size_bytes": 0
+        "slot_size_bytes": 0,
+        "hixl_engine_addr": "127.0.0.1:9901"
     },
     "scheduler": {
         "schedule_policy": "passthrough",
@@ -48,6 +49,10 @@
     },
     "transfer": {
         "protocol": "brpc",
+        "data_protocol": "brpc",
+        "hixl_fallback_to_brpc": true,
+        "hixl_local_engine": "",
+        "hixl_timeout_ms": 5000,
         "meta_pool_size": 4,
         "store_pool_size": 4,
         "rpc_timeout_ms": 5000,

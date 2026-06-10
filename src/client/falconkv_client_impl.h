@@ -8,6 +8,7 @@
 #include "src/common/types.h"
 #include "src/common/config.h"
 #include "src/client/key_desc_cache.h"
+#include "src/client/remote_read_backend.h"
 #include "src/store/falconkv_store.h"
 #include "src/store/store_meta_index.h"
 #include "src/store/node_local_accessor.h"
@@ -87,6 +88,7 @@ private:
     FalconKVStore* local_store_ = nullptr;       // not owned
     NodeLocalAccessor node_accessor_;
     StoreRpcClientManager store_rpc_mgr_;
+    std::unique_ptr<RemoteReadBackend> remote_read_backend_;
 
     // Scheduler integration
     std::unique_ptr<SchedulerProxy> scheduler_proxy_;
@@ -100,6 +102,8 @@ private:
 
     // Local store address (host:port) for remote-read source identification.
     std::string local_store_addr_;
+
+    TransferConfig transfer_config_;
 };
 
 } // namespace falconkv

@@ -1,6 +1,7 @@
 set(CLIENT_TESTS
     test_key_desc_cache
     test_data_structures
+    test_remote_read_backend
 )
 
 foreach(TEST_NAME ${CLIENT_TESTS})

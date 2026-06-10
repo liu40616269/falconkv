@@ -68,6 +68,7 @@ FalconKVStore::Config FalconKVStore::Config::FromStoreConfig(const StoreConfig& 
     cfg.direct_io_enabled = sc.direct_io_enabled;
     cfg.io_uring_queue_depth = sc.io_uring_queue_depth;
     cfg.slot_size_bytes = sc.slot_size_bytes;
+    cfg.hixl_engine_addr = sc.hixl_engine_addr;
     return cfg;
 }
 

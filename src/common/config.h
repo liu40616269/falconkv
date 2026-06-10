@@ -47,6 +47,7 @@ struct StoreConfig {
     bool direct_io_enabled = true;
     uint32_t io_uring_queue_depth = 128;
     uint32_t slot_size_bytes = 0;  // 0 = auto-detect from first write, >0 = explicit slot size
+    std::string hixl_engine_addr = "";
 };
 
 struct SchedulerConfig {
@@ -75,6 +76,10 @@ struct ClientConfig {
 
 struct TransferConfig {
     std::string protocol = "brpc";
+    std::string data_protocol = "brpc";
+    bool hixl_fallback_to_brpc = true;
+    std::string hixl_local_engine = "";
+    int hixl_timeout_ms = 5000;
     std::string meta_addr = "localhost:8900";
     int meta_pool_size = 4;
     int store_pool_size = 4;

@@ -47,6 +47,14 @@ public:
                      const std::vector<void*>& buffers,
                      std::vector<int32_t>& results);
 
+    Status PrepareHixlBatchRead(const std::vector<uint64_t>& offsets,
+                                const std::vector<uint32_t>& sizes,
+                                uint32_t client_id,
+                                const std::string& source_node_addr,
+                                HixlBatchReadResponse* response);
+
+    Status ReleaseHixlRead(const std::string& token);
+
     /// Ping the remote store.
     Status Ping();
 
