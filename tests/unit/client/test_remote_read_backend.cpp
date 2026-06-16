@@ -66,4 +66,38 @@ TEST(RemoteReadBackend, RejectsInvalidRequestShape) {
     EXPECT_EQ(results[0], -1);
 }
 
+TEST(RemoteReadBackend, ParsesHostNetworkHixlConfig) {
+    const char* json = R"json({
+        "store": {
+            "hixl_engine_addr": "10.0.0.2:9901",
+            "hixl_local_comm_res": "{\"version\":\"1.3\",\"endpoint_list\":[{\"protocol\":\"roce\",\"comm_id\":\"10.0.0.2\",\"placement\":\"host\"}]}",
+            "hixl_protocol_desc": "roce:host",
+            "hixl_rdma_traffic_class": 132,
+            "hixl_rdma_service_level": 4
+        },
+        "transfer": {
+            "data_protocol": "hixl",
+            "hixl_local_engine": "10.0.0.1:9902",
+            "hixl_local_comm_res": "{\"version\":\"1.3\",\"endpoint_list\":[{\"protocol\":\"roce\",\"comm_id\":\"10.0.0.1\",\"placement\":\"host\"}]}",
+            "hixl_protocol_desc": "roce:host",
+            "hixl_timeout_ms": 7000
+        }
+    })json";
+
+    FalconKVConfig config = ConfigLoader::LoadFromString(json);
+
+    EXPECT_EQ(config.store.hixl_engine_addr, "10.0.0.2:9901");
+    EXPECT_NE(config.store.hixl_local_comm_res.find("\"placement\":\"host\""),
+              std::string::npos);
+    EXPECT_EQ(config.store.hixl_protocol_desc, "roce:host");
+    EXPECT_EQ(config.store.hixl_rdma_traffic_class, 132);
+    EXPECT_EQ(config.store.hixl_rdma_service_level, 4);
+    EXPECT_EQ(config.transfer.data_protocol, "hixl");
+    EXPECT_EQ(config.transfer.hixl_local_engine, "10.0.0.1:9902");
+    EXPECT_NE(config.transfer.hixl_local_comm_res.find("\"protocol\":\"roce\""),
+              std::string::npos);
+    EXPECT_EQ(config.transfer.hixl_protocol_desc, "roce:host");
+    EXPECT_EQ(config.transfer.hixl_timeout_ms, 7000);
+}
+
 } // namespace falconkv

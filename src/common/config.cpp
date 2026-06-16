@@ -87,6 +87,12 @@ void ApplyEnvOverrides(FalconKVConfig& config) {
     config.store.io_uring_queue_depth = GetEnvOrDefaultUInt("FALCONKV_IO_URING_QUEUE_DEPTH", config.store.io_uring_queue_depth);
     config.store.slot_size_bytes = GetEnvOrDefaultUInt("FALCONKV_SLOT_SIZE_BYTES", config.store.slot_size_bytes);
     config.store.hixl_engine_addr = GetEnvOrDefault("FALCONKV_STORE_HIXL_ENGINE_ADDR", config.store.hixl_engine_addr);
+    config.store.hixl_local_comm_res = GetEnvOrDefault("FALCONKV_STORE_HIXL_LOCAL_COMM_RES", config.store.hixl_local_comm_res);
+    config.store.hixl_global_resource_config = GetEnvOrDefault("FALCONKV_STORE_HIXL_GLOBAL_RESOURCE_CONFIG", config.store.hixl_global_resource_config);
+    config.store.hixl_protocol_desc = GetEnvOrDefault("FALCONKV_STORE_HIXL_PROTOCOL_DESC", config.store.hixl_protocol_desc);
+    config.store.hixl_buffer_pool = GetEnvOrDefault("FALCONKV_STORE_HIXL_BUFFER_POOL", config.store.hixl_buffer_pool);
+    config.store.hixl_rdma_traffic_class = GetEnvOrDefaultInt("FALCONKV_STORE_HIXL_RDMA_TRAFFIC_CLASS", config.store.hixl_rdma_traffic_class);
+    config.store.hixl_rdma_service_level = GetEnvOrDefaultInt("FALCONKV_STORE_HIXL_RDMA_SERVICE_LEVEL", config.store.hixl_rdma_service_level);
 
     // Scheduler config overrides
     config.scheduler.uds_path = GetEnvOrDefault("FALCONKV_SCHED_UDS_PATH", config.scheduler.uds_path);
@@ -107,6 +113,12 @@ void ApplyEnvOverrides(FalconKVConfig& config) {
     config.transfer.hixl_fallback_to_brpc = GetEnvOrDefault("FALCONKV_HIXL_FALLBACK_TO_BRPC",
                                                             config.transfer.hixl_fallback_to_brpc ? "1" : "0") == "1";
     config.transfer.hixl_local_engine = GetEnvOrDefault("FALCONKV_HIXL_LOCAL_ENGINE", config.transfer.hixl_local_engine);
+    config.transfer.hixl_local_comm_res = GetEnvOrDefault("FALCONKV_HIXL_LOCAL_COMM_RES", config.transfer.hixl_local_comm_res);
+    config.transfer.hixl_global_resource_config = GetEnvOrDefault("FALCONKV_HIXL_GLOBAL_RESOURCE_CONFIG", config.transfer.hixl_global_resource_config);
+    config.transfer.hixl_protocol_desc = GetEnvOrDefault("FALCONKV_HIXL_PROTOCOL_DESC", config.transfer.hixl_protocol_desc);
+    config.transfer.hixl_buffer_pool = GetEnvOrDefault("FALCONKV_HIXL_BUFFER_POOL", config.transfer.hixl_buffer_pool);
+    config.transfer.hixl_rdma_traffic_class = GetEnvOrDefaultInt("FALCONKV_HIXL_RDMA_TRAFFIC_CLASS", config.transfer.hixl_rdma_traffic_class);
+    config.transfer.hixl_rdma_service_level = GetEnvOrDefaultInt("FALCONKV_HIXL_RDMA_SERVICE_LEVEL", config.transfer.hixl_rdma_service_level);
     config.transfer.hixl_timeout_ms = GetEnvOrDefaultInt("FALCONKV_HIXL_TIMEOUT_MS", config.transfer.hixl_timeout_ms);
     config.transfer.meta_addr = GetEnvOrDefault("FALCONKV_TRANSFER_META_ADDR", config.transfer.meta_addr);
     config.transfer.meta_pool_size = GetEnvOrDefaultInt("FALCONKV_META_POOL_SIZE", config.transfer.meta_pool_size);
@@ -180,6 +192,12 @@ void ParseStoreConfig(const Json::Value& root, StoreConfig& cfg) {
     if (s.isMember("io_uring_queue_depth"))   cfg.io_uring_queue_depth = s["io_uring_queue_depth"].asUInt();
     if (s.isMember("slot_size_bytes"))        cfg.slot_size_bytes = s["slot_size_bytes"].asUInt();
     if (s.isMember("hixl_engine_addr"))       cfg.hixl_engine_addr = s["hixl_engine_addr"].asString();
+    if (s.isMember("hixl_local_comm_res"))    cfg.hixl_local_comm_res = s["hixl_local_comm_res"].asString();
+    if (s.isMember("hixl_global_resource_config")) cfg.hixl_global_resource_config = s["hixl_global_resource_config"].asString();
+    if (s.isMember("hixl_protocol_desc"))     cfg.hixl_protocol_desc = s["hixl_protocol_desc"].asString();
+    if (s.isMember("hixl_buffer_pool"))       cfg.hixl_buffer_pool = s["hixl_buffer_pool"].asString();
+    if (s.isMember("hixl_rdma_traffic_class")) cfg.hixl_rdma_traffic_class = s["hixl_rdma_traffic_class"].asInt();
+    if (s.isMember("hixl_rdma_service_level")) cfg.hixl_rdma_service_level = s["hixl_rdma_service_level"].asInt();
 }
 
 void ParseSchedulerConfig(const Json::Value& root, SchedulerConfig& cfg) {
@@ -208,6 +226,12 @@ void ParseTransferConfig(const Json::Value& root, TransferConfig& cfg) {
     if (t.isMember("data_protocol"))      cfg.data_protocol = t["data_protocol"].asString();
     if (t.isMember("hixl_fallback_to_brpc")) cfg.hixl_fallback_to_brpc = t["hixl_fallback_to_brpc"].asBool();
     if (t.isMember("hixl_local_engine"))  cfg.hixl_local_engine = t["hixl_local_engine"].asString();
+    if (t.isMember("hixl_local_comm_res")) cfg.hixl_local_comm_res = t["hixl_local_comm_res"].asString();
+    if (t.isMember("hixl_global_resource_config")) cfg.hixl_global_resource_config = t["hixl_global_resource_config"].asString();
+    if (t.isMember("hixl_protocol_desc")) cfg.hixl_protocol_desc = t["hixl_protocol_desc"].asString();
+    if (t.isMember("hixl_buffer_pool"))   cfg.hixl_buffer_pool = t["hixl_buffer_pool"].asString();
+    if (t.isMember("hixl_rdma_traffic_class")) cfg.hixl_rdma_traffic_class = t["hixl_rdma_traffic_class"].asInt();
+    if (t.isMember("hixl_rdma_service_level")) cfg.hixl_rdma_service_level = t["hixl_rdma_service_level"].asInt();
     if (t.isMember("hixl_timeout_ms"))    cfg.hixl_timeout_ms = t["hixl_timeout_ms"].asInt();
     if (t.isMember("meta_pool_size"))     cfg.meta_pool_size = t["meta_pool_size"].asInt();
     if (t.isMember("store_pool_size"))    cfg.store_pool_size = t["store_pool_size"].asInt();

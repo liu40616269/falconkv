@@ -33,7 +33,13 @@
         "direct_io_enabled": true,
         "io_uring_queue_depth": 128,
         "slot_size_bytes": 0,
-        "hixl_engine_addr": "127.0.0.1:9901"
+        "hixl_engine_addr": "127.0.0.1:9901",
+        "hixl_local_comm_res": "",
+        "hixl_global_resource_config": "",
+        "hixl_protocol_desc": "roce:host",
+        "hixl_buffer_pool": "",
+        "hixl_rdma_traffic_class": -1,
+        "hixl_rdma_service_level": -1
     },
     "scheduler": {
         "schedule_policy": "passthrough",
@@ -52,6 +58,12 @@
         "data_protocol": "brpc",
         "hixl_fallback_to_brpc": true,
         "hixl_local_engine": "",
+        "hixl_local_comm_res": "",
+        "hixl_global_resource_config": "",
+        "hixl_protocol_desc": "roce:host",
+        "hixl_buffer_pool": "",
+        "hixl_rdma_traffic_class": -1,
+        "hixl_rdma_service_level": -1,
         "hixl_timeout_ms": 5000,
         "meta_pool_size": 4,
         "store_pool_size": 4,

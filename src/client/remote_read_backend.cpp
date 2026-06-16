@@ -21,6 +21,49 @@ Status ValidateRequest(const RemoteReadRequest& request) {
     return Status::OK();
 }
 
+#ifdef FALCONKV_HAS_HIXL
+void AddIfNotEmpty(std::map<hixl::AscendString, hixl::AscendString>* options,
+                   const char* key,
+                   const std::string& value) {
+    if (!value.empty()) {
+        (*options)[key] = value.c_str();
+    }
+}
+
+std::string BuildProtocolDescConfig(const std::string& protocol_desc) {
+    if (protocol_desc.empty()) {
+        return "";
+    }
+    return std::string("{\"comm_resource_config.protocol_desc\":\"") +
+           protocol_desc + "\"}";
+}
+
+std::map<hixl::AscendString, hixl::AscendString> BuildHixlOptions(
+    const TransferConfig& config) {
+    std::map<hixl::AscendString, hixl::AscendString> options;
+    AddIfNotEmpty(&options, hixl::OPTION_LOCAL_COMM_RES,
+                  config.hixl_local_comm_res);
+    if (!config.hixl_global_resource_config.empty()) {
+        AddIfNotEmpty(&options, hixl::OPTION_GLOBAL_RESOURCE_CONFIG,
+                      config.hixl_global_resource_config);
+    } else {
+        AddIfNotEmpty(&options, hixl::OPTION_GLOBAL_RESOURCE_CONFIG,
+                      BuildProtocolDescConfig(config.hixl_protocol_desc));
+    }
+    AddIfNotEmpty(&options, hixl::OPTION_BUFFER_POOL,
+                  config.hixl_buffer_pool);
+    if (config.hixl_rdma_traffic_class >= 0) {
+        AddIfNotEmpty(&options, hixl::OPTION_RDMA_TRAFFIC_CLASS,
+                      std::to_string(config.hixl_rdma_traffic_class));
+    }
+    if (config.hixl_rdma_service_level >= 0) {
+        AddIfNotEmpty(&options, hixl::OPTION_RDMA_SERVICE_LEVEL,
+                      std::to_string(config.hixl_rdma_service_level));
+    }
+    return options;
+}
+#endif
+
 } // namespace
 
 BrpcRemoteReadBackend::BrpcRemoteReadBackend(StoreRpcClientManager* rpc_manager)
@@ -73,7 +116,8 @@ Status HixlRemoteReadBackend::EnsureHixlInitialized() {
     }
 
     hixl_engine_ = std::make_unique<hixl::Hixl>();
-    std::map<hixl::AscendString, hixl::AscendString> options;
+    std::map<hixl::AscendString, hixl::AscendString> options =
+        BuildHixlOptions(config_);
     hixl::Status ret = hixl_engine_->Initialize(config_.hixl_local_engine.c_str(),
                                                 options);
     if (ret != hixl::SUCCESS) {

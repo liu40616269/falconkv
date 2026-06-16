@@ -48,6 +48,12 @@ struct StoreConfig {
     uint32_t io_uring_queue_depth = 128;
     uint32_t slot_size_bytes = 0;  // 0 = auto-detect from first write, >0 = explicit slot size
     std::string hixl_engine_addr = "";
+    std::string hixl_local_comm_res = "";
+    std::string hixl_global_resource_config = "";
+    std::string hixl_protocol_desc = "";
+    std::string hixl_buffer_pool = "";
+    int hixl_rdma_traffic_class = -1;
+    int hixl_rdma_service_level = -1;
 };
 
 struct SchedulerConfig {
@@ -79,6 +85,12 @@ struct TransferConfig {
     std::string data_protocol = "brpc";
     bool hixl_fallback_to_brpc = true;
     std::string hixl_local_engine = "";
+    std::string hixl_local_comm_res = "";
+    std::string hixl_global_resource_config = "";
+    std::string hixl_protocol_desc = "";
+    std::string hixl_buffer_pool = "";
+    int hixl_rdma_traffic_class = -1;
+    int hixl_rdma_service_level = -1;
     int hixl_timeout_ms = 5000;
     std::string meta_addr = "localhost:8900";
     int meta_pool_size = 4;

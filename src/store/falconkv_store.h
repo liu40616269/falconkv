@@ -83,6 +83,12 @@ public:
         uint32_t io_uring_queue_depth = 128;
         uint32_t slot_size_bytes = 0;  // 0 = auto-detect from first write
         std::string hixl_engine_addr = "";
+        std::string hixl_local_comm_res = "";
+        std::string hixl_global_resource_config = "";
+        std::string hixl_protocol_desc = "";
+        std::string hixl_buffer_pool = "";
+        int hixl_rdma_traffic_class = -1;
+        int hixl_rdma_service_level = -1;
 
         static Config FromStoreConfig(const StoreConfig& sc);
     };
@@ -118,6 +124,7 @@ public:
     const std::string& data_file() const { return data_file_; }
     SchedulerProxy* scheduler_proxy() const { return scheduler_proxy_.get(); }
     const std::string& hixl_engine_addr() const { return config_.hixl_engine_addr; }
+    const Config& config() const { return config_; }
 
 private:
     Status InitDataFile();

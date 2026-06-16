@@ -69,6 +69,12 @@ FalconKVStore::Config FalconKVStore::Config::FromStoreConfig(const StoreConfig& 
     cfg.io_uring_queue_depth = sc.io_uring_queue_depth;
     cfg.slot_size_bytes = sc.slot_size_bytes;
     cfg.hixl_engine_addr = sc.hixl_engine_addr;
+    cfg.hixl_local_comm_res = sc.hixl_local_comm_res;
+    cfg.hixl_global_resource_config = sc.hixl_global_resource_config;
+    cfg.hixl_protocol_desc = sc.hixl_protocol_desc;
+    cfg.hixl_buffer_pool = sc.hixl_buffer_pool;
+    cfg.hixl_rdma_traffic_class = sc.hixl_rdma_traffic_class;
+    cfg.hixl_rdma_service_level = sc.hixl_rdma_service_level;
     return cfg;
 }
 
